@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "exported_at": "2026-08-06T21:20:00.000Z",
+  "data_start": "2026-07-30T00:00:00.000Z",
+  "data_end": "2026-08-06T21:20:00.000Z",
+  "complete": true,
+  "errors": [],
+  "glucose_samples": [
+    {
+      "source": "apple_health",
+      "source_sample_id": "aaaaaaaa-1111-2222-3333-444444444401",
+      "source_name": "Stelo",
+      "sample_time": "2026-08-05T14:15:00.000Z",
+      "value": 96,
+      "unit": "mg/dL",
+      "metadata": {
+        "source_app": "Stelo"
+      }
+    },
+    {
+      "source": "apple_health",
+      "source_sample_id": "aaaaaaaa-1111-2222-3333-444444444402",
+      "source_name": "Stelo",
+      "sample_time": "2026-08-05T14:30:00.000Z",
+      "value": 102,
+      "unit": "mg/dL",
+      "metadata": {
+        "source_app": "Stelo"
+      }
+    }
+  ],
+  "workouts": [
+    {
+      "source": "apple_health",
+      "source_sample_id": "bbbbbbbb-1111-2222-3333-444444444401",
+      "source_name": "Strava",
+      "start_time": "2026-08-05T06:00:00.000Z",
+      "end_time": "2026-08-05T06:32:00.000Z",
+      "sport": "running",
+      "distance_meters": 5200,
+      "active_energy_kcal": 310,
+      "average_heart_rate": 148,
+      "maximum_heart_rate": 172,
+      "metadata": {
+        "source_app": "Strava"
+      }
+    }
+  ],
+  "sleep_sessions": [
+    {
+      "source": "apple_health",
+      "source_sample_id": "cccccccc-1111-2222-3333-444444444401",
+      "source_name": "Apple Watch",
+      "start_time": "2026-08-05T23:10:00.000Z",
+      "end_time": "2026-08-06T00:30:00.000Z",
+      "stage": "core",
+      "metadata": {
+        "source_app": "Apple Watch"
+      }
+    },
+    {
+      "source": "apple_health",
+      "source_sample_id": "cccccccc-1111-2222-3333-444444444402",
+      "source_name": "Apple Watch",
+      "start_time": "2026-08-06T00:30:00.000Z",
+      "end_time": "2026-08-06T01:10:00.000Z",
+      "stage": "deep",
+      "metadata": {
+        "source_app": "Apple Watch"
+      }
+    }
+  ],
+  "weight_measurements": [
+    {
+      "source": "apple_health",
+      "source_sample_id": "dddddddd-1111-2222-3333-444444444401",
+      "source_name": "Health",
+      "measured_at": "2026-08-04T08:00:00.000Z",
+      "value": 72.5,
+      "unit": "kg",
+      "metadata": {
+        "source_app": "Health"
+      }
+    }
+  ],
+  "meal_events": [
+    {
+      "source": "manual",
+      "source_sample_id": "meal-eeeeeeee-1111-2222-3333-444444444401",
+      "meal_completed_at": "2026-08-05T19:42:00.000Z",
+      "foods": [
+        "rice",
+        "chicken"
+      ],
+      "notes": "normal dinner"
+    }
+  ]
+}

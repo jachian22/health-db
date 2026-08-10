@@ -1,33 +1,57 @@
-"""Application settings loaded from environment variables."""
+"""Application configuration via environment variables."""
 
 from functools import lru_cache
 
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
-    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/health_db"
-    environment: str = "development"
-    api_key: str = "dev-api-key-change-me"
-    cors_origins: str = "*"
+    database_url: str = Field(
+        default="postgresql+asyncpg://postgres:postgres@localhost:5432/health_db",
+        alias="DATABASE_URL",
+    )
+    ingest_api_key: str = Field(default="dev-ingest-key-change-me", alias="INGEST_API_KEY")
+    read_api_key: str = Field(default="dev-read-key-change-me", alias="READ_API_KEY")
+    environment: str = Field(default="development", alias="ENVIRONMENT")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    cors_origins: str = Field(default="*", alias="CORS_ORIGINS")
+    db_echo: bool = Field(default=False, alias="DB_ECHO")
 
-    max_lookback_days: int = 365
+    # Query bounds
     default_lookback_days: int = 30
-    max_rows_per_response: int = 5000
-    log_level: str = "INFO"
-    db_echo: bool = False
+    max_lookback_days: int = 365
+    default_row_cap: int = 5000
+    hard_row_cap: int = 20_000
+
+    # Phase 1 single principal
+    primary_user_external_id: str = "personal-primary"
+
+    @model_validator(mode="after")
+    def keys_must_differ(self) -> "Settings":
+        if self.ingest_api_key == self.read_api_key:
+            raise ValueError(
+                "INGEST_API_KEY and READ_API_KEY must be different: "
+                "role separation cannot work with a shared key."
+            )
+        return self
 
     @property
     def cors_origin_list(self) -> list[str]:
-        if self.cors_origins.strip() == "*":
+        raw = self.cors_origins.strip()
+        if raw == "*":
             return ["*"]
-        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
     @property
     def sync_database_url(self) -> str:
-        """Sync driver URL for Alembic migrations."""
+        """Sync URL for Alembic (psycopg2)."""
         url = self.database_url
         if url.startswith("postgresql+asyncpg://"):
             return url.replace("postgresql+asyncpg://", "postgresql://", 1)
@@ -37,12 +61,11 @@ class Settings(BaseSettings):
 
     @property
     def async_database_url(self) -> str:
-        """Ensure asyncpg driver for runtime."""
         url = self.database_url
+        if url.startswith("postgresql://"):
+            return url.replace("postgresql://", "postgresql+asyncpg://", 1)
         if url.startswith("postgres://"):
             return url.replace("postgres://", "postgresql+asyncpg://", 1)
-        if url.startswith("postgresql://") and "+asyncpg" not in url:
-            return url.replace("postgresql://", "postgresql+asyncpg://", 1)
         return url
 
 

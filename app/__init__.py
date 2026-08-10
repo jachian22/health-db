@@ -1,3 +1,3 @@
-"""Health data platform — Phase 1."""
+"""Health Data Platform — Phase 1."""
 
 __version__ = "0.1.0"

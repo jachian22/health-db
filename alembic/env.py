@@ -6,13 +6,13 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from app.core.config import get_settings
-from app.db.session import Base
-from app.models import (  # noqa: F401 — register models on Base.metadata
+from app.db.base import Base
+from app.db.models import (  # noqa: F401 — register models
     GlucoseSample,
-    HealthSource,
+    IngestionBatch,
     MealEvent,
-    SleepSession,
-    SyncState,
+    RequestAuditLog,
+    SleepInterval,
     User,
     WeightMeasurement,
     Workout,

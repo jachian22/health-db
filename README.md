@@ -1,176 +1,269 @@
 # Health Data Platform — Phase 1
 
-Personal health data API for one user. Accepts normalized events from an iPhone extractor, stores them in Postgres, and exposes a bounded, typed, read-oriented surface designed for agent consumption.
+Personal FastAPI + PostgreSQL service that ingests an iOS HealthKit export, stores normalized health data idempotently, and exposes a narrow authenticated read API for later agent consumption.
 
-## What Phase 1 includes
+## What Phase 1 does
 
-- Batch ingestion with idempotent upserts and soft-delete tombstones
-- Series, summary, and event lookup endpoints
-- Planner-lite (`/v1/plan/retrieve`) for recommending retrieval ranges
-- API key auth on all data endpoints
-- Hard lookback / row-count / resolution bounds
-- Alembic migrations for Railway Postgres
+- Accept version-1 iOS export payloads via `POST /v1/ingest/batch`
+- Store one raw payload copy per ingestion batch (audit/debug)
+- Upsert typed rows keyed by `(user_id, source, source_sample_id)`
+- Expose bounded read endpoints for glucose, runs, sleep intervals, weight, and meals
+- Separate ingest and read API keys
+- Request ID + metadata-only audit logging
 
-## Stack
+## What Phase 1 does **not** do
 
-- FastAPI + Pydantic v2
-- SQLAlchemy 2 (async) + asyncpg
-- Alembic
-- Railway (Postgres + API service)
+- Direct HealthKit access, iOS upload, OAuth, or multi-user product flows
+- MCP / planner / compare / daily-weekly summary endpoints
+- Arbitrary SQL or natural-language → SQL
+- Sleep sessionization, fasting windows, meal-response derivation
+- Charts or UI
+- Railway deployment (repo is ready; deploy is deferred)
 
-## Project layout
+## Architecture
 
 ```text
-app/
-├── api/          # route handlers (ingest, series, summary, events, plan)
-├── core/         # config, auth, bounds, errors, logging
-├── db/           # engine / session
-├── models/       # SQLAlchemy models
-├── schemas/      # Pydantic request/response models
-├── services/     # business logic
-└── main.py
-alembic/          # migrations
-tests/
+Future iOS exporter
+      |
+      | POST /v1/ingest/batch
+      v
+FastAPI service
+      |
+      | validate, report, upsert
+      v
+PostgreSQL
+      |
+      +-- ingestion_batches (audit/debug)
+      +-- typed health records
+      |
+      v
+Authenticated read API
+      |
+      v
+Future agent tools / MCP harness
 ```
+
+## Environment variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `DATABASE_URL` | yes | Async Postgres URL (`postgresql+asyncpg://...`) |
+| `INGEST_API_KEY` | yes | Bearer key for ingest endpoints only |
+| `READ_API_KEY` | yes | Bearer key for read/query endpoints only |
+| `ENVIRONMENT` | no | `development` / `test` / `production` |
+| `LOG_LEVEL` | no | Default `INFO` |
+| `CORS_ORIGINS` | no | `*` or comma-separated origins |
+
+Copy `.env.example` to `.env` and edit values. Never commit secrets.
 
 ## Local setup
 
 ```bash
+# Optional: local Postgres + API via Docker
+docker compose up -d db
+
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env
 ```
 
-Start Postgres (local or Railway), set `DATABASE_URL` in `.env`, then:
+With [uv](https://github.com/astral-sh/uv):
+
+```bash
+uv venv && source .venv/bin/activate
+uv pip install -e ".[dev]"
+```
+
+## Migrations
 
 ```bash
 alembic upgrade head
-uvicorn app.main:app --reload --port 8000
 ```
 
-Open docs at `http://localhost:8000/docs`.
+This creates tables and idempotently seeds `personal-primary`.
 
-## Auth
+Downgrade (dev only):
 
-Pass the API key on every data request:
-
-```http
-Authorization: Bearer <API_KEY>
+```bash
+alembic downgrade -1
 ```
 
-or
+## Run the API
 
-```http
-X-API-Key: <API_KEY>
+```bash
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-## CORS
+Docs: http://localhost:8000/docs
 
-`CORS_ORIGINS` defaults to `*`. When using the wildcard, credentials are disabled (Fetch spec). Set an explicit origin list to enable credentials.
-## Ingestion
+Or full stack:
+
+```bash
+docker compose up --build
+```
+
+## Authentication roles
+
+| Key | Role | Access |
+|---|---|---|
+| `INGEST_API_KEY` | `ingest` | `POST /v1/ingest/batch` only |
+| `READ_API_KEY` | `read` | `/v1/query/...` only |
+
+- Missing/invalid key → `401 UNAUTHORIZED`
+- Valid key, wrong role → `403 FORBIDDEN`
+- `GET /health` is unauthenticated
+
+Identity is resolved from auth context as `personal-primary`. Clients must **not** send `user_id`.
+
+## Idempotency
+
+Record identity: `(user_id, source, source_sample_id)`.
+
+| Situation | Result |
+|---|---|
+| New identity | insert |
+| Same identity + same fields | unchanged |
+| Same identity + changed fields | update |
+| Invalid entity | rejected (reported); other entity types still ingest |
+
+## Range semantics
+
+All time-range queries use half-open windows:
+
+```text
+[start, end)
+```
+
+Include records at exactly `start`; exclude records at exactly `end`. Maximum range: **365 days**. Default row cap: **5000**. Hard cap: **20000**. Overflow returns `TOO_MANY_ROWS` (never silent truncation).
+
+## Example curl commands
+
+### Health check
+
+```bash
+curl http://localhost:8000/health
+```
+
+### Ingest
 
 ```bash
 curl -X POST http://localhost:8000/v1/ingest/batch \
-  -H "Authorization: Bearer $API_KEY" \
+  -H "Authorization: Bearer $INGEST_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{
-    "user_id": "user_1",
-    "glucose_samples": [{
-      "source_name": "stelo",
-      "source_sample_id": "abc",
-      "sample_time": "2026-08-01T10:00:00Z",
-      "value": 110,
-      "unit": "mg/dL"
-    }],
+  -d @- <<'EOF'
+{
+  "payload": {
+    "complete": true,
+    "schema_version": 1,
+    "exported_at": "2026-08-10T20:02:50.510Z",
+    "data_start": "2026-07-30T00:00:00.000Z",
+    "data_end": "2026-08-10T20:02:50.369Z",
+    "errors": [],
+    "glucose_samples": [],
     "workouts": [],
     "sleep_sessions": [],
     "weight_measurements": [],
-    "meal_events": [],
-    "sync_state": []
-  }'
+    "meal_events": []
+  }
+}
+EOF
 ```
 
-Upserts are keyed by `(user, source, source_sample_id)`. Set `deleted_at` to tombstone a sample.
-
-## Read API (QUERY / POST)
-
-Read endpoints accept HTTP `QUERY` (preferred) or `POST` with a JSON body. All require `start` and `end` (UTC).
-
-| Endpoint | Purpose |
-|---|---|
-| `QUERY /v1/series/glucose` | Time-series points (optional resolution: `raw`, `1m`, `5m`, `15m`, `1h`, `1d`) |
-| `QUERY /v1/series/runs` | Workout markers (optional `sport` substring filter) |
-| `QUERY /v1/series/sleep` | Sleep sessions |
-| `QUERY /v1/series/weight` | Weight points |
-| `QUERY /v1/series/meals` | Meal intervals + `anchor` (`meal_completed_at` or `meal_end`) |
-| `QUERY /v1/summary/daily` | Per-day aggregates |
-| `QUERY /v1/summary/weekly` | Per-week aggregates |
-| `QUERY /v1/summary/glucose` | Glucose stats (+ `group_by`) |
-| `QUERY /v1/summary/runs` | Run stats |
-| `QUERY /v1/summary/sleep` | Sleep stats |
-| `QUERY /v1/events/meals` | Meal event lookup |
-| `QUERY /v1/events/runs` | Run event lookup |
-| `QUERY /v1/events/glucose` | Glucose event lookup |
-| `QUERY /v1/plan/retrieve` | Planner-lite retrieval recommendations |
-
-Example:
+### Glucose query
 
 ```bash
-curl -X POST http://localhost:8000/v1/series/glucose \
-  -H "Authorization: Bearer $API_KEY" \
+curl -X POST http://localhost:8000/v1/query/series/glucose \
+  -H "Authorization: Bearer $READ_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "start": "2026-07-06T00:00:00Z",
-    "end": "2026-08-05T00:00:00Z",
-    "resolution": "15m",
-    "user_id": "user_1"
+    "start": "2026-08-01T00:00:00Z",
+    "end": "2026-08-08T00:00:00Z",
+    "resolution": "raw",
+    "limit": 5000
   }'
 ```
 
-Responses use a stable envelope:
+### Runs query
 
-```json
-{
-  "data": [],
-  "meta": { "count": 0, "start": "...", "end": "...", "resolution": "15m", "bounded": true },
-  "warnings": [],
-  "next_cursor": null
-}
+```bash
+curl -X POST http://localhost:8000/v1/query/series/runs \
+  -H "Authorization: Bearer $READ_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": "2026-08-01T00:00:00Z",
+    "end": "2026-08-08T00:00:00Z"
+  }'
 ```
 
-## Bounds
+### Sleep query
 
-| Policy | Default |
-|---|---|
-| Max lookback | 365 days (`MAX_LOOKBACK_DAYS`) |
-| Default lookback | 30 days |
-| Max rows | 5000 (`MAX_ROWS_PER_RESPONSE`) |
-| Resolutions | `raw`, `1m`, `5m`, `15m`, `1h`, `1d` |
+```bash
+curl -X POST http://localhost:8000/v1/query/series/sleep \
+  -H "Authorization: Bearer $READ_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": "2026-08-01T00:00:00Z",
+    "end": "2026-08-08T00:00:00Z",
+    "stages": ["core", "deep", "rem", "awake"]
+  }'
+```
 
-Errors are structured: `UNAUTHORIZED`, `INVALID_RANGE`, `RANGE_TOO_WIDE`, `UNSUPPORTED_RESOLUTION`, `TOO_MANY_ROWS`, etc.
+### Weight query
 
-## Meals and completion anchors
+```bash
+curl -X POST http://localhost:8000/v1/query/series/weight \
+  -H "Authorization: Bearer $READ_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": "2026-08-01T00:00:00Z",
+    "end": "2026-08-08T00:00:00Z"
+  }'
+```
 
-Meals store `meal_start` and `meal_end`. Optional `meal_completed_at` is the future canonical pivot for fasting windows and post-meal glucose response. Series responses expose `anchor` = `meal_completed_at` if set, else `meal_end`.
+### Meals query
 
-## Railway deploy
+```bash
+curl -X POST http://localhost:8000/v1/query/events/meals \
+  -H "Authorization: Bearer $READ_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": "2026-08-01T00:00:00Z",
+    "end": "2026-08-08T00:00:00Z"
+  }'
+```
 
-1. Create a Railway project with a Postgres plugin and this API service.
-2. Set env vars: `DATABASE_URL` (auto-linked), `API_KEY`, `ENVIRONMENT=production`.
-3. Deploy. `railway.json` runs `alembic upgrade head` then starts uvicorn on `$PORT`.
+## Data privacy / logging policy
 
-Private networking between the API and Postgres is preferred; do not expose Postgres publicly.
+**Logged / audited (metadata only):** request ID, path, method, auth role, status, latency, query window, resolution, row count, error code.
+
+**Not logged:** Authorization headers, raw export payloads (except the intentional one-copy `ingestion_batches.raw_payload`), glucose arrays, meal foods/text, full response bodies, database credentials.
 
 ## Tests
 
+Requires a running Postgres (e.g. `docker compose up -d db`).
+
 ```bash
-pip install -e ".[dev]"
+export DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/health_db_test
+# create DB once:
+psql postgresql://postgres:postgres@localhost:5432/postgres -c 'CREATE DATABASE health_db_test;'
+alembic upgrade head   # against health_db_test via DATABASE_URL
 pytest
 ```
 
-Tests use in-memory SQLite and do not require Postgres.
+Or use the helper in `tests/conftest.py`, which migrates the test database automatically when `DATABASE_URL` / `TEST_DATABASE_URL` is set.
+
+## Railway deployment checklist (future — not yet executed)
+
+1. Provision Railway Postgres
+2. Set `DATABASE_URL`, `INGEST_API_KEY`, `READ_API_KEY`, `ENVIRONMENT=production`
+3. Deploy API (`alembic upgrade head` then uvicorn on `$PORT`)
+4. Authenticated ingest of a real export
+5. Replay the same export → no duplicate typed rows
+6. Authenticated read endpoints return expected rows
+
+Do not manually edit the Railway production database.
 
 ## Phase 1 principle
 
-Safe, typed, queryable data with a disciplined retrieval contract — not a database shell.
+The database is the source of truth. The API enforces identity, validation, and query boundaries so a future agent can select tools and ranges safely.
