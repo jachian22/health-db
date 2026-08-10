@@ -257,25 +257,19 @@ Or use the helper in `tests/conftest.py`, which migrates the test database autom
 
 This step is intentionally **API-only**: no Postgres wiring, no Alembic on boot, no ingestion secrets required for the service to become healthy.
 
-**Start command** (Docker `CMD` via `scripts/start.sh`):
+**Start command** (must run under a shell so `$PORT` expands):
+
+```bash
+sh -c 'exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}'
+```
+
+Do **not** set a dashboard start command to:
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port $PORT
 ```
 
-- FastAPI module/variable: `app.main:app`
-- Railway injects `PORT`; the process binds to `0.0.0.0:$PORT` (defaults to `8000` if unset)
-- Health check path: `GET /health` → `{"status":"ok"}` (HTTP 200, no database)
-- The Docker image does **not** run Alembic on boot
-
-Postgres is **not** configured in this deployment step. Migrations and `DATABASE_URL` come later.
-
-### Railway dashboard
-
-- Builder: Dockerfile (`Dockerfile`)
-- Do **not** set a custom start-command override unless it matches the uvicorn command above
-- Health-check path: `/health`
-- `INGEST_API_KEY` / `READ_API_KEY` are optional for a healthy boot (defaults exist)
+Railway can pass the literal string `$PORT` into uvicorn (which then fails with `'$PORT' is not a valid integer`). Either clear the custom start command (use the Dockerfile `CMD`) or use the `sh -c` form above.
 ### Later (not this step)
 
 1. Provision Railway Postgres and set `DATABASE_URL`
