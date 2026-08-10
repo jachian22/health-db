@@ -1,8 +1,11 @@
 """Application configuration via environment variables."""
 
-from functools import lru_cache
+from __future__ import annotations
 
-from pydantic import Field
+from functools import lru_cache
+from typing import Any
+
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,6 +35,31 @@ class Settings(BaseSettings):
 
     # Phase 1 single principal
     primary_user_external_id: str = "personal-primary"
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_blank_env_values(cls, data: Any) -> Any:
+        # Railway dashboard blanks often show up as "". Drop them so defaults apply.
+        if isinstance(data, dict):
+            return {
+                key: value
+                for key, value in data.items()
+                if not (isinstance(value, str) and value.strip() == "")
+            }
+        return data
+
+    @field_validator("db_echo", mode="before")
+    @classmethod
+    def coerce_db_echo(cls, value: object) -> object:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+        return value
 
     @property
     def cors_origin_list(self) -> list[str]:

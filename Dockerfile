@@ -15,13 +15,11 @@ COPY pyproject.toml README.md ./
 COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./
-COPY scripts/start.sh ./scripts/start.sh
 
-RUN pip install --upgrade pip && pip install . \
-    && chmod +x /app/scripts/start.sh
+RUN pip install --upgrade pip && pip install .
 
 EXPOSE 8000
 
-# Railway injects PORT. Entrypoint defaults to 8000 if unset.
-# Do not run Alembic here — Postgres is not required for a healthy boot.
-CMD ["/app/scripts/start.sh"]
+# Inline shell CMD avoids shebang/script issues and always expands PORT.
+# Prints diagnostics so Railway deploy logs show whether the process started.
+CMD ["sh", "-c", "echo starting health-db on 0.0.0.0:${PORT:-8000} && exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
