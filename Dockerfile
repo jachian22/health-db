@@ -15,11 +15,13 @@ COPY pyproject.toml README.md ./
 COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./
+COPY scripts/start.sh ./scripts/start.sh
 
-RUN pip install --upgrade pip && pip install .
+RUN pip install --upgrade pip && pip install . \
+    && chmod +x /app/scripts/start.sh
 
 EXPOSE 8000
 
-# Bind to Railway's $PORT. Use exec so uvicorn receives OS signals.
+# Railway injects PORT. Entrypoint defaults to 8000 if unset.
 # Do not run Alembic here — Postgres is not required for a healthy boot.
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["/app/scripts/start.sh"]

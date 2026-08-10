@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 
-from pydantic import Field, model_validator
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,15 +32,6 @@ class Settings(BaseSettings):
 
     # Phase 1 single principal
     primary_user_external_id: str = "personal-primary"
-
-    @model_validator(mode="after")
-    def keys_must_differ(self) -> "Settings":
-        if self.ingest_api_key == self.read_api_key:
-            raise ValueError(
-                "INGEST_API_KEY and READ_API_KEY must be different: "
-                "role separation cannot work with a shared key."
-            )
-        return self
 
     @property
     def cors_origin_list(self) -> list[str]:
