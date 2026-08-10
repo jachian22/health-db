@@ -253,14 +253,32 @@ pytest
 
 Or use the helper in `tests/conftest.py`, which migrates the test database automatically when `DATABASE_URL` / `TEST_DATABASE_URL` is set.
 
-## Railway deployment checklist (future — not yet executed)
+## Railway deployment
 
-1. Provision Railway Postgres
-2. Set `DATABASE_URL`, `INGEST_API_KEY`, `READ_API_KEY`, `ENVIRONMENT=production`
-3. Deploy API (`alembic upgrade head` then uvicorn on `$PORT`)
-4. Authenticated ingest of a real export
-5. Replay the same export → no duplicate typed rows
-6. Authenticated read endpoints return expected rows
+This step is intentionally **API-only**: no Postgres wiring, no Alembic on boot, no ingestion secrets required for the service to become healthy.
+
+**Start command** (configured in `railway.json`):
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
+
+- FastAPI module/variable: `app.main:app`
+- Railway injects `PORT`; the process binds to `0.0.0.0:$PORT` (not localhost / not a hard-coded 8000)
+- Health check path: `GET /health` → `{"status":"ok"}` (HTTP 200, no database)
+
+Postgres is **not** configured in this deployment step. Migrations and `DATABASE_URL` come later.
+
+### Railway dashboard
+
+If the service overrides the start command in the dashboard, set it to the same uvicorn command above (or clear the override so `railway.json` is used). Keep the health-check path at `/health`.
+
+### Later (not this step)
+
+1. Provision Railway Postgres and set `DATABASE_URL`
+2. Set distinct `INGEST_API_KEY` and `READ_API_KEY`
+3. Run Alembic (`alembic upgrade head`) before or as a separate release step
+4. Authenticated ingest + read verification
 
 Do not manually edit the Railway production database.
 
