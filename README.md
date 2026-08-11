@@ -9,7 +9,7 @@ Personal FastAPI + PostgreSQL service that ingests an iOS HealthKit export, stor
 - Upsert typed rows keyed by `(user_id, source, source_sample_id)`
 - Expose bounded read endpoints for glucose, runs, sleep intervals, weight, and meals
 - Separate ingest and read API keys
-- Request ID + metadata-only audit logging
+- Request ID on every response (persistent request-audit storage is deferred to a later phase)
 
 ## What Phase 1 does **not** do
 
@@ -252,7 +252,7 @@ curl -X POST http://localhost:8000/v1/query/events/meals \
 
 ## Data privacy / logging policy
 
-**Logged / audited (metadata only):** request ID, path, method, auth role, status, latency, query window, resolution, row count, error code.
+**Logged (application logs, metadata only):** request ID, path, method, status, error type. Persistent per-request audit rows (`request_audit_logs`) are deferred to a later phase; the Phase 1 schema intentionally omits that table.
 
 **Not logged:** Authorization headers, raw export payloads (except the intentional one-copy `ingestion_batches.raw_payload`), glucose arrays, meal foods/text, full response bodies, database credentials.
 

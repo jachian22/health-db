@@ -2,16 +2,16 @@
 
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from alembic import context
 from app.core.config import get_settings
 from app.db.base import Base
-from app.db.models import (  # noqa: F401 — register models
+from app.db.models import (  # noqa: F401 — register models on Base.metadata
     GlucoseSample,
+    HealthSource,
     IngestionBatch,
     MealEvent,
-    RequestAuditLog,
     SleepInterval,
     User,
     WeightMeasurement,
@@ -23,8 +23,11 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
-settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.sync_database_url)
+
+# Tests set sqlalchemy.url programmatically via Config.set_main_option and
+# must win; otherwise resolve from app settings / DATABASE_URL.
+if not config.get_main_option("sqlalchemy.url"):
+    config.set_main_option("sqlalchemy.url", get_settings().sync_database_url)
 
 
 def run_migrations_offline() -> None:

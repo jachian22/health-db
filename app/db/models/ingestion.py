@@ -1,4 +1,4 @@
-"""Ingestion batch audit model — one raw payload copy per export."""
+"""Ingestion batch audit — one raw payload copy per iOS export."""
 
 from __future__ import annotations
 
@@ -6,15 +6,34 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Integer, Text, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Text,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db.base import Base, TimestampMixin, uuid_pk
+from app.db.base import Base, uuid_pk
+
+INGESTION_BATCH_STATUSES = ("received", "processed", "partial", "failed")
 
 
-class IngestionBatch(TimestampMixin, Base):
+class IngestionBatch(Base):
     __tablename__ = "ingestion_batches"
+    __table_args__ = (
+        CheckConstraint("data_end > data_start", name="data_end_after_data_start"),
+        CheckConstraint(
+            "status IN ('received', 'processed', 'partial', 'failed')",
+            name="status_valid",
+        ),
+        Index("ix_ingestion_batches_user_id_received_at", "user_id", "received_at"),
+        Index("ix_ingestion_batches_user_id_payload_sha256", "user_id", "payload_sha256"),
+    )
 
     id: Mapped[uuid.UUID] = uuid_pk()
     user_id: Mapped[uuid.UUID] = mapped_column(
@@ -30,7 +49,7 @@ class IngestionBatch(TimestampMixin, Base):
     payload_sha256: Mapped[str] = mapped_column(Text, nullable=False)
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
-    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
     glucose_inserted: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     glucose_updated: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
@@ -56,3 +75,5 @@ class IngestionBatch(TimestampMixin, Base):
     meals_updated: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     meals_unchanged: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     meals_rejected: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+    error_summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)

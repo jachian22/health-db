@@ -29,7 +29,7 @@ async def test_ingest_fixture_and_replay(
     first = await client.post("/v1/ingest/batch", headers=ingest_headers, json=ingest_body)
     assert first.status_code == 200, first.text
     body = first.json()
-    assert body["status"] == "completed"
+    assert body["status"] == "processed"
     assert body["results"]["glucose_samples"]["inserted"] == 2
     assert body["results"]["workouts"]["inserted"] == 1
     assert body["results"]["sleep_sessions"]["inserted"] == 2
@@ -112,7 +112,7 @@ async def test_invalid_glucose_does_not_block_meals(
     resp = await client.post("/v1/ingest/batch", headers=ingest_headers, json=body)
     assert resp.status_code == 200
     data = resp.json()
-    assert data["status"] == "completed_with_rejections"
+    assert data["status"] == "partial"
     assert data["results"]["glucose_samples"]["rejected"] == 1
     assert data["results"]["meal_events"]["inserted"] == 1
     assert any(r["code"] == "INVALID_UNIT" for r in data["rejections"])

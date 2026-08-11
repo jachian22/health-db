@@ -75,7 +75,7 @@ def _mount_phase1(application: FastAPI) -> None:
     from fastapi.responses import JSONResponse
     from starlette.requests import Request
 
-    from app.api.errors import AppError, ErrorResponse, app_error_handler
+    from app.api.errors import AppError, app_error_handler
     from app.api.v1 import events, ingest, series
     from app.core.config import get_settings
     from app.core.request_id import RequestIdMiddleware

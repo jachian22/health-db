@@ -201,17 +201,13 @@ async def test_runs_sleep_overlap_and_meals_weight(
 
 
 @pytest.mark.asyncio
-async def test_request_audit_records_user_and_metadata(
+async def test_request_audit_deferred_without_table(
     client: AsyncClient,
     ingest_headers: dict,
     read_headers: dict,
     ingest_body: dict,
 ):
-    from sqlalchemy import select
-
-    from app.db.models import RequestAuditLog, User
-    from app.db.session import get_session_factory
-
+    """Phase 1 omits request_audit_logs; queries must still succeed."""
     await _seed(client, ingest_headers, ingest_body)
     resp = await client.post(
         "/v1/query/series/glucose",
@@ -223,29 +219,8 @@ async def test_request_audit_records_user_and_metadata(
         },
     )
     assert resp.status_code == 200
-    request_id = resp.headers["X-Request-ID"]
-
-    factory = get_session_factory()
-    async with factory() as session:
-        audit = (
-            await session.execute(
-                select(RequestAuditLog).where(
-                    RequestAuditLog.path == "/v1/query/series/glucose"
-                )
-            )
-        ).scalars().all()
-        assert audit, "expected an audit row for the glucose query"
-        row = audit[-1]
-        assert str(row.request_id) == request_id
-        assert row.auth_role == "read"
-        assert row.requested_resolution == "raw"
-        assert row.rows_returned == 2
-        user = (
-            await session.execute(
-                select(User).where(User.external_identifier == "personal-primary")
-            )
-        ).scalar_one()
-        assert row.user_id == user.id
+    assert "X-Request-ID" in resp.headers
+    assert resp.json()["meta"]["row_count"] == 2
 
 
 @pytest.mark.asyncio

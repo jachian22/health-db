@@ -122,8 +122,8 @@ async def client(
                   sleep_intervals,
                   weight_measurements,
                   meal_events,
-                  request_audit_logs,
-                  ingestion_batches
+                  ingestion_batches,
+                  health_sources
                 RESTART IDENTITY CASCADE
                 """
             )

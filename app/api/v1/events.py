@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter
 
 from app.api.dependencies import DbSession
 from app.core.security import RequireRead
@@ -25,13 +25,8 @@ router = APIRouter(prefix="/v1/query/events", tags=["events"])
 )
 async def meals_events(
     body: MealsQuery,
-    request: Request,
     auth: RequireRead,
     db: DbSession,
 ) -> QueryResponse:
     user = await query_service.resolve_user(db, auth.external_user_id)
-    response = await query_service.query_meals(db, user.id, body)
-    request.state.query_start = body.start
-    request.state.query_end = body.end
-    request.state.rows_returned = response.meta.row_count
-    return response
+    return await query_service.query_meals(db, user.id, body)

@@ -78,7 +78,7 @@ class _EntitySpec:
     # Column names compared by IS DISTINCT FROM to decide updated vs unchanged.
     meaningful_columns: tuple[str, ...]
     # Validated item -> full column-name -> value row dict (identity + fields).
-    row_builder: Callable[[Any, uuid.UUID, uuid.UUID], dict[str, Any]]
+    row_builder: Callable[[Any, uuid.UUID], dict[str, Any]]
     # Optional per-item warning (used for sleep stage normalization).
     warning_for: Callable[[Any], str | None] = lambda _item: None
 
@@ -126,7 +126,7 @@ async def get_primary_user(session: AsyncSession, external_id: str) -> User:
     return user
 
 
-def _glucose_row(item: GlucoseSampleIn, user_id: uuid.UUID, batch_id: uuid.UUID) -> dict[str, Any]:
+def _glucose_row(item: GlucoseSampleIn, user_id: uuid.UUID) -> dict[str, Any]:
     return {
         "user_id": user_id,
         "source": item.source,
@@ -136,11 +136,10 @@ def _glucose_row(item: GlucoseSampleIn, user_id: uuid.UUID, batch_id: uuid.UUID)
         "value_mg_dl": _decimal(item.value),
         "trend": item.trend,
         "metadata": item.metadata,
-        "ingestion_batch_id": batch_id,
     }
 
 
-def _workout_row(item: WorkoutIn, user_id: uuid.UUID, batch_id: uuid.UUID) -> dict[str, Any]:
+def _workout_row(item: WorkoutIn, user_id: uuid.UUID) -> dict[str, Any]:
     return {
         "user_id": user_id,
         "source": item.source,
@@ -154,11 +153,10 @@ def _workout_row(item: WorkoutIn, user_id: uuid.UUID, batch_id: uuid.UUID) -> di
         "average_heart_rate": _decimal(item.average_heart_rate),
         "maximum_heart_rate": _decimal(item.maximum_heart_rate),
         "metadata": item.metadata,
-        "ingestion_batch_id": batch_id,
     }
 
 
-def _sleep_row(item: SleepIntervalIn, user_id: uuid.UUID, batch_id: uuid.UUID) -> dict[str, Any]:
+def _sleep_row(item: SleepIntervalIn, user_id: uuid.UUID) -> dict[str, Any]:
     return {
         "user_id": user_id,
         "source": item.source,
@@ -168,13 +166,10 @@ def _sleep_row(item: SleepIntervalIn, user_id: uuid.UUID, batch_id: uuid.UUID) -
         "end_time": item.end_time,
         "stage": item.stage,
         "metadata": item.metadata,
-        "ingestion_batch_id": batch_id,
     }
 
 
-def _weight_row(
-    item: WeightMeasurementIn, user_id: uuid.UUID, batch_id: uuid.UUID
-) -> dict[str, Any]:
+def _weight_row(item: WeightMeasurementIn, user_id: uuid.UUID) -> dict[str, Any]:
     return {
         "user_id": user_id,
         "source": item.source,
@@ -183,11 +178,10 @@ def _weight_row(
         "measured_at": item.measured_at,
         "value_kg": _decimal(item.value),
         "metadata": item.metadata,
-        "ingestion_batch_id": batch_id,
     }
 
 
-def _meal_row(item: MealEventIn, user_id: uuid.UUID, batch_id: uuid.UUID) -> dict[str, Any]:
+def _meal_row(item: MealEventIn, user_id: uuid.UUID) -> dict[str, Any]:
     return {
         "user_id": user_id,
         "source": item.source,
@@ -197,7 +191,6 @@ def _meal_row(item: MealEventIn, user_id: uuid.UUID, batch_id: uuid.UUID) -> dic
         "foods": item.foods,
         "notes": item.notes,
         "metadata": item.metadata,
-        "ingestion_batch_id": batch_id,
     }
 
 
@@ -267,7 +260,6 @@ async def _upsert_entity(
     session_factory: async_sessionmaker[AsyncSession],
     spec: _EntitySpec,
     user_id: uuid.UUID,
-    batch_id: uuid.UUID,
     raw_items: list[dict[str, Any]],
 ) -> _EntityOutcome:
     outcome = _EntityOutcome()
@@ -301,13 +293,12 @@ async def _upsert_entity(
             "the last occurrence of each was applied."
         )
 
-    rows = [spec.row_builder(item, user_id, batch_id) for item in deduped.values()]
+    rows = [spec.row_builder(item, user_id) for item in deduped.values()]
     table = sa.inspect(spec.model).local_table
 
     stmt = pg_insert(table).values(rows)
     excluded = stmt.excluded
     set_: dict[str, Any] = {col: excluded[col] for col in spec.meaningful_columns}
-    set_["ingestion_batch_id"] = excluded["ingestion_batch_id"]
     set_["deleted_at"] = None
     set_["updated_at"] = sa.func.now()
 
@@ -377,13 +368,17 @@ async def ingest_batch(
                 data_end=payload.data_end,
                 payload_sha256=checksum,
                 raw_payload=raw_payload,
-                status="processing",
+                status="received",
                 request_id=request_id,
             )
             session.add(batch)
             await session.flush()
             batch_id = batch.id
             user_id = user.id
+
+    # A batch stays 'received' only if the process dies mid-ingest; some typed
+    # rows may already be committed in that window. Replaying the same payload
+    # is safe (idempotent upserts). Reconciliation of stuck batches is deferred.
 
     entity_payloads = {
         "glucose_samples": payload.glucose_samples,
@@ -394,12 +389,12 @@ async def ingest_batch(
     }
 
     # Each entity type runs in its own transaction. If anything blows up,
-    # mark the batch failed instead of leaving it stuck in 'processing'.
+    # mark the batch failed instead of leaving it stuck in 'received'.
     outcomes: dict[str, _EntityOutcome] = {}
     try:
         for entity_type, items in entity_payloads.items():
             outcomes[entity_type] = await _upsert_entity(
-                session_factory, _ENTITY_SPECS[entity_type], user_id, batch_id, items
+                session_factory, _ENTITY_SPECS[entity_type], user_id, items
             )
     except Exception:
         await _mark_batch_failed(session_factory, batch_id)
@@ -410,12 +405,10 @@ async def ingest_batch(
         rejections.extend(outcome.rejections)
 
     any_rejected = any(o.counts.rejected > 0 for o in outcomes.values())
-    if payload.errors:
-        status = "completed_with_source_errors"
-    elif any_rejected:
-        status = "completed_with_rejections"
+    if payload.errors or any_rejected:
+        status = "partial"
     else:
-        status = "completed"
+        status = "processed"
 
     counts = {name: outcome.counts for name, outcome in outcomes.items()}
     async with session_factory() as session:
