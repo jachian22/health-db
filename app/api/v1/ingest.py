@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 
-from app.core.security import RequireIngest
+from app.core.security import require_ingest_auth
 from app.db.session import get_session_factory
 from app.schemas.export import HealthExportPayload
 from app.schemas.ingestion import IngestBatchResponse
 from app.services.ingestion import ingest_batch
 
-router = APIRouter(prefix="/v1/ingest", tags=["ingest"])
+router = APIRouter(
+    prefix="/v1/ingest",
+    tags=["ingest"],
+    # Auth is enforced for its side effect (401 on bad/missing key);
+    # identity is server-owned, so handlers never consume the auth context.
+    dependencies=[Depends(require_ingest_auth)],
+)
 
 
 @router.post(
@@ -232,9 +238,7 @@ router = APIRouter(prefix="/v1/ingest", tags=["ingest"])
 async def ingest_export_batch(
     body: HealthExportPayload,
     request: Request,
-    auth: RequireIngest,
 ) -> IngestBatchResponse:
-    _ = auth  # auth dependency enforces INGEST_API_KEY; identity is server-owned
     return await ingest_batch(
         session_factory=get_session_factory(),
         payload=body,

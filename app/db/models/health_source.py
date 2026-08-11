@@ -21,6 +21,16 @@ class HealthSource(TimestampMixin, Base):
             "source_name",
             name="uq_health_sources_user_id_source_source_name",
         ),
+        # Postgres unique constraints treat NULLs as distinct, so NULL
+        # source_name rows need their own partial unique index for
+        # ON CONFLICT upserts (NULLS NOT DISTINCT needs PG15+; dev runs 14).
+        Index(
+            "uq_health_sources_user_id_source_null_name",
+            "user_id",
+            "source",
+            unique=True,
+            postgresql_where=text("source_name IS NULL"),
+        ),
         Index("ix_health_sources_user_id_source", "user_id", "source"),
     )
 

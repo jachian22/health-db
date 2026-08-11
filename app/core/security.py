@@ -105,5 +105,4 @@ def require_role(*allowed: AuthRole):
     return _dependency
 
 
-RequireIngest = Annotated[AuthContext, Depends(require_ingest_auth)]
 RequireRead = Annotated[AuthContext, Depends(require_role(AuthRole.READ))]

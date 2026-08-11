@@ -314,6 +314,77 @@ async def test_duplicate_identity_in_payload_applies_last(
 
 
 @pytest.mark.asyncio
+async def test_bulk_insert_chunks_across_statements(
+    client: AsyncClient,
+    ingest_headers: dict[str, str],
+    ingest_body: dict,
+    session_factory: async_sessionmaker,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Large batches must split into multiple INSERT statements (asyncpg
+    caps bind parameters) while still returning correct aggregate counts."""
+    from app.services import ingestion as ingestion_module
+
+    # Glucose rows bind 9 params each; a cap of 20 forces chunks of 2 rows.
+    monkeypatch.setattr(ingestion_module, "MAX_BIND_PARAMS_PER_STATEMENT", 20)
+
+    body = copy.deepcopy(ingest_body)
+    body["glucose_samples"] = [
+        {
+            "source": "apple_health",
+            "source_name": "Stelo",
+            "source_sample_id": f"glucose-chunk-{i:03d}",
+            "sample_time": f"2026-08-01T02:{i:02d}:00.000Z",
+            "value": 90 + i,
+            "unit": "mg/dL",
+            "metadata": {},
+        }
+        for i in range(7)
+    ]
+
+    first = await client.post("/v1/ingest/batch", headers=ingest_headers, json=body)
+    assert first.status_code == 200, first.text
+    assert first.json()["summary"]["glucose_samples"]["inserted"] == 7
+
+    async with session_factory() as session:
+        assert (
+            await session.execute(select(func.count()).select_from(GlucoseSample))
+        ).scalar() == 7
+
+    replay = await client.post("/v1/ingest/batch", headers=ingest_headers, json=body)
+    assert replay.status_code == 200
+    replay_counts = replay.json()["summary"]["glucose_samples"]
+    assert replay_counts["unchanged"] == 7
+    assert replay_counts["inserted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_null_source_name_resolves_single_catalog_row(
+    client: AsyncClient,
+    ingest_headers: dict[str, str],
+    ingest_body: dict,
+    session_factory: async_sessionmaker,
+):
+    """Manual meals have no source_name (NULL); NULLS NOT DISTINCT must
+    dedupe the catalog row across replays instead of accumulating copies."""
+    await client.post("/v1/ingest/batch", headers=ingest_headers, json=ingest_body)
+    await client.post("/v1/ingest/batch", headers=ingest_headers, json=ingest_body)
+
+    async with session_factory() as session:
+        manual_rows = (
+            await session.execute(
+                select(func.count())
+                .select_from(HealthSource)
+                .where(
+                    HealthSource.source == "manual",
+                    HealthSource.source_name.is_(None),
+                )
+            )
+        ).scalar()
+        assert manual_rows == 1
+
+
+@pytest.mark.asyncio
 async def test_upsert_failure_returns_sanitized_ingestion_failed(
     client: AsyncClient,
     ingest_headers: dict[str, str],

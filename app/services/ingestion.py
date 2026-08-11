@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import time
 import uuid
 from collections.abc import Callable
@@ -60,14 +59,34 @@ logger = get_logger(__name__)
 REJECTION_RETURN_CAP = 100
 PERSONAL_PRIMARY = "personal-primary"
 
-# Validators embed a machine-readable code prefix in their messages
-# (e.g. ValueError("INVALID_UNIT: …")) so rejection codes are deterministic.
-_REJECTION_CODE_RE = re.compile(
-    r"(INVALID_UNIT|INVALID_TIMESTAMP|INVALID_SLEEP_STAGE|INVALID_WORKOUT|"
-    r"UNSUPPORTED_WORKOUT_SOURCE|INVALID_REQUEST):\s*"
+# asyncpg caps bind parameters per statement at 32767 (int16). Chunk bulk
+# inserts well below that so a full HealthKit export cannot overflow it.
+MAX_BIND_PARAMS_PER_STATEMENT = 20_000
+
+# Error types raised as PydanticCustomError by the export schemas.
+# ValidationError.errors()[n]["type"] carries them directly — no parsing.
+_REJECTION_CODES = frozenset(
+    {
+        "INVALID_UNIT",
+        "INVALID_TIMESTAMP",
+        "INVALID_WORKOUT",
+        "UNSUPPORTED_WORKOUT_SOURCE",
+        "INVALID_REQUEST",
+    }
 )
 
 _APP_SOURCE_NAMES = frozenset({"Stelo", "Strava", "Health"})
+
+# Maps response entity keys to the column prefixes on ingestion_batches
+# (e.g. sleep_sessions -> sleep_inserted / sleep_updated / ...).
+_BATCH_COLUMN_PREFIXES = {
+    "glucose_samples": "glucose",
+    "workouts": "workouts",
+    "sleep_sessions": "sleep",
+    "weight_measurements": "weight",
+    "meal_events": "meals",
+}
+_COUNT_METRICS = ("inserted", "updated", "unchanged", "rejected")
 
 
 @dataclass
@@ -101,18 +120,22 @@ def _rejection_from(
     index: int,
 ) -> IngestRejection:
     errors = exc.errors()
-    raw_msg = str(errors[0]["msg"]) if errors else str(exc)
-    match = _REJECTION_CODE_RE.search(raw_msg)
-    code = match.group(1) if match else "INVALID_REQUEST"
-    # Strip Pydantic's "Value error, " wrapper and our code prefix for readability.
-    message = _REJECTION_CODE_RE.sub("", raw_msg).removeprefix("Value error, ").strip()
-    message = message or raw_msg
-    # Forbid / extra-field errors for meal_start / meal_end → clear contract message.
-    if errors and errors[0].get("type") == "extra_forbidden":
-        loc = errors[0].get("loc") or ()
-        field = loc[-1] if loc else "field"
-        code = "INVALID_REQUEST"
-        message = f"Unexpected field '{field}' is not allowed"
+    if not errors:
+        code, message = "INVALID_REQUEST", "Record failed validation"
+    else:
+        err = errors[0]
+        err_type = str(err.get("type", ""))
+        if err_type in _REJECTION_CODES:
+            code, message = err_type, str(err.get("msg", ""))
+        elif err_type == "extra_forbidden":
+            # Strict contract fields (e.g. meal_start / meal_end on meals).
+            loc = err.get("loc") or ()
+            field_name = loc[-1] if loc else "field"
+            code = "INVALID_REQUEST"
+            message = f"Unexpected field '{field_name}' is not allowed"
+        else:
+            # Built-in Pydantic errors (missing, greater_than, …).
+            code, message = "INVALID_REQUEST", str(err.get("msg", ""))
     sample_id = raw.get("source_sample_id")
     return IngestRejection(
         entity_type=entity_type,
@@ -156,9 +179,13 @@ async def get_or_create_personal_user(session: AsyncSession) -> User:
     inserted = (await session.execute(stmt)).scalar_one_or_none()
     if inserted is not None:
         user = await session.get(User, inserted)
-        assert user is not None
+        if user is None:
+            raise RuntimeError(
+                f"User row {inserted} vanished within its own transaction"
+            )
         return user
 
+    # Another request inserted the user between our select and insert.
     result = await session.execute(
         select(User).where(User.external_identifier == external_id)
     )
@@ -173,67 +200,41 @@ async def _resolve_health_source(
     source: str,
     source_name: str | None,
 ) -> uuid.UUID:
-    """Idempotently resolve/create a health_sources catalog row."""
-    source_type = _infer_source_type(source, source_name)
-    conditions = [
-        HealthSource.user_id == user_id,
-        HealthSource.source == source,
-    ]
+    """Idempotently resolve/create a health_sources catalog row.
+
+    Single round-trip upsert. Postgres unique constraints treat NULLs as
+    distinct, so NULL source_name rows are covered by a partial unique
+    index (migration 002) and the conflict target is chosen per case.
+    DO UPDATE keeps an existing source_type when the new one is NULL,
+    and always RETURNs the row id.
+    """
+    table = HealthSource.__table__
+    stmt = pg_insert(table).values(
+        {
+            "user_id": user_id,
+            "source": source,
+            "source_name": source_name,
+            "source_type": _infer_source_type(source, source_name),
+            "metadata": {},
+        }
+    )
+    set_ = {
+        "source_type": sa.func.coalesce(
+            stmt.excluded.source_type, table.c.source_type
+        )
+    }
     if source_name is None:
-        conditions.append(HealthSource.source_name.is_(None))
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["user_id", "source"],
+            index_where=table.c.source_name.is_(None),
+            set_=set_,
+        )
     else:
-        conditions.append(HealthSource.source_name == source_name)
-
-    existing = (
-        await session.execute(select(HealthSource).where(*conditions))
-    ).scalar_one_or_none()
-    if existing is not None:
-        if source_type and existing.source_type != source_type:
-            existing.source_type = source_type
-        return existing.id
-
-    stmt = (
-        pg_insert(HealthSource.__table__)
-        .values(
-            {
-                "user_id": user_id,
-                "source": source,
-                "source_name": source_name,
-                "source_type": source_type,
-                "metadata": {},
-            }
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_health_sources_user_id_source_source_name",
+            set_=set_,
         )
-        .on_conflict_do_nothing(
-            constraint="uq_health_sources_user_id_source_source_name"
-        )
-        .returning(HealthSource.__table__.c.id)
-    )
-    try:
-        new_id = (await session.execute(stmt)).scalar_one_or_none()
-    except Exception:
-        # NULL source_name uniqueness is awkward in Postgres; fall back to select.
-        new_id = None
-
-    if new_id is not None:
-        return new_id
-
-    existing = (
-        await session.execute(select(HealthSource).where(*conditions))
-    ).scalar_one_or_none()
-    if existing is not None:
-        return existing.id
-
-    # Last resort: insert without relying on ON CONFLICT (NULL source_name case).
-    row = HealthSource(
-        user_id=user_id,
-        source=source,
-        source_name=source_name,
-        source_type=source_type,
-        metadata_={},
-    )
-    session.add(row)
-    await session.flush()
-    return row.id
+    return (await session.execute(stmt.returning(table.c.id))).scalar_one()
 
 
 def _glucose_row(
@@ -440,40 +441,63 @@ async def _upsert_entity(
 
     async with session_factory() as session:
         async with session.begin():
+            # Resolve each distinct (source, source_name) catalog row once per
+            # batch instead of once per record.
+            source_cache: dict[tuple[str, str | None], uuid.UUID] = {}
             rows: list[dict[str, Any]] = []
             for item in deduped.values():
-                health_source_id = await _resolve_health_source(
-                    session,
-                    user_id=user_id,
-                    source=item.source,
-                    source_name=item.source_name,
-                )
+                cache_key = (item.source, item.source_name)
+                health_source_id = source_cache.get(cache_key)
+                if health_source_id is None:
+                    health_source_id = await _resolve_health_source(
+                        session,
+                        user_id=user_id,
+                        source=item.source,
+                        source_name=item.source_name,
+                    )
+                    source_cache[cache_key] = health_source_id
                 rows.append(spec.row_builder(item, user_id, health_source_id))
 
             table = sa.inspect(spec.model).local_table
-            stmt = pg_insert(table).values(rows)
-            excluded = stmt.excluded
-            set_: dict[str, Any] = {col: excluded[col] for col in spec.meaningful_columns}
-            set_["updated_at"] = sa.func.now()
+            flags: list[bool] = []
+            # asyncpg limits bind parameters per statement; chunk large batches
+            # so a full HealthKit export cannot overflow it.
+            params_per_row = len(rows[0])
+            chunk_size = max(1, MAX_BIND_PARAMS_PER_STATEMENT // params_per_row)
+            for start in range(0, len(rows), chunk_size):
+                chunk = rows[start : start + chunk_size]
+                stmt = pg_insert(table).values(chunk)
+                excluded = stmt.excluded
+                set_: dict[str, Any] = {
+                    col: excluded[col] for col in spec.meaningful_columns
+                }
+                set_["updated_at"] = sa.func.now()
 
-            # Only update live rows; never revive soft-deleted records.
-            changed = sa.and_(
-                table.c.deleted_at.is_(None),
-                sa.or_(
-                    *[
-                        table.c[col].is_distinct_from(excluded[col])
-                        for col in spec.meaningful_columns
-                    ]
-                ),
-            )
-            stmt = stmt.on_conflict_do_update(
-                index_elements=["user_id", "source", "source_sample_id"],
-                set_=set_,
-                where=changed,
-            ).returning(sa.literal_column("(xmax = 0)").label("was_inserted"))
+                # Only update live rows; never revive soft-deleted records.
+                changed = sa.and_(
+                    table.c.deleted_at.is_(None),
+                    sa.or_(
+                        *[
+                            table.c[col].is_distinct_from(excluded[col])
+                            for col in spec.meaningful_columns
+                        ]
+                    ),
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["user_id", "source", "source_sample_id"],
+                    set_=set_,
+                    where=changed,
+                ).returning(
+                    # xmax is a Postgres MVCC system column: 0 means the row
+                    # version was created by this statement (insert); non-zero
+                    # means an existing row was updated. This is a widely used
+                    # but implementation-specific trick — revisit if Postgres
+                    # storage semantics ever change.
+                    sa.literal_column("(xmax = 0)").label("was_inserted")
+                )
 
-            result = await session.execute(stmt)
-            flags = [row.was_inserted for row in result]
+                result = await session.execute(stmt)
+                flags.extend(row.was_inserted for row in result)
 
     inserted = sum(1 for f in flags if f)
     outcome.counts.inserted = inserted
@@ -571,28 +595,19 @@ async def ingest_batch(
         async with session_factory() as session:
             async with session.begin():
                 batch = await session.get(IngestionBatch, batch_id)
-                assert batch is not None
+                if batch is None:
+                    raise RuntimeError(
+                        f"Ingestion batch {batch_id} disappeared before finalization"
+                    )
                 batch.status = status
-                batch.glucose_inserted = counts["glucose_samples"].inserted
-                batch.glucose_updated = counts["glucose_samples"].updated
-                batch.glucose_unchanged = counts["glucose_samples"].unchanged
-                batch.glucose_rejected = counts["glucose_samples"].rejected
-                batch.workouts_inserted = counts["workouts"].inserted
-                batch.workouts_updated = counts["workouts"].updated
-                batch.workouts_unchanged = counts["workouts"].unchanged
-                batch.workouts_rejected = counts["workouts"].rejected
-                batch.sleep_inserted = counts["sleep_sessions"].inserted
-                batch.sleep_updated = counts["sleep_sessions"].updated
-                batch.sleep_unchanged = counts["sleep_sessions"].unchanged
-                batch.sleep_rejected = counts["sleep_sessions"].rejected
-                batch.weight_inserted = counts["weight_measurements"].inserted
-                batch.weight_updated = counts["weight_measurements"].updated
-                batch.weight_unchanged = counts["weight_measurements"].unchanged
-                batch.weight_rejected = counts["weight_measurements"].rejected
-                batch.meals_inserted = counts["meal_events"].inserted
-                batch.meals_updated = counts["meal_events"].updated
-                batch.meals_unchanged = counts["meal_events"].unchanged
-                batch.meals_rejected = counts["meal_events"].rejected
+                for entity_type, prefix in _BATCH_COLUMN_PREFIXES.items():
+                    entity_counts = counts[entity_type]
+                    for metric in _COUNT_METRICS:
+                        setattr(
+                            batch,
+                            f"{prefix}_{metric}",
+                            getattr(entity_counts, metric),
+                        )
                 if any_rejected:
                     batch.error_summary = {
                         "rejected_total": sum(o.counts.rejected for o in outcomes.values()),
@@ -600,51 +615,23 @@ async def ingest_batch(
                     }
 
         latency_ms = int((time.perf_counter() - started) * 1000)
+        log_fields: dict[str, Any] = {
+            "request_id": request_id,
+            "ingestion_batch_id": batch_id,
+            "status": status,
+            "schema_version": payload.schema_version,
+            "data_start": payload.data_start.isoformat(),
+            "data_end": payload.data_end.isoformat(),
+            "latency_ms": latency_ms,
+        }
+        for entity_type, prefix in _BATCH_COLUMN_PREFIXES.items():
+            entity_counts = counts[entity_type]
+            log_fields[f"{prefix}_received"] = entity_counts.received
+            for metric in _COUNT_METRICS:
+                log_fields[f"{prefix}_{metric}"] = getattr(entity_counts, metric)
         logger.info(
-            "ingestion_complete request_id=%s ingestion_batch_id=%s status=%s "
-            "schema_version=%s data_start=%s data_end=%s latency_ms=%s "
-            "glucose_received=%s glucose_inserted=%s glucose_updated=%s "
-            "glucose_unchanged=%s glucose_rejected=%s "
-            "workouts_received=%s workouts_inserted=%s workouts_updated=%s "
-            "workouts_unchanged=%s workouts_rejected=%s "
-            "sleep_received=%s sleep_inserted=%s sleep_updated=%s "
-            "sleep_unchanged=%s sleep_rejected=%s "
-            "weight_received=%s weight_inserted=%s weight_updated=%s "
-            "weight_unchanged=%s weight_rejected=%s "
-            "meals_received=%s meals_inserted=%s meals_updated=%s "
-            "meals_unchanged=%s meals_rejected=%s",
-            request_id,
-            batch_id,
-            status,
-            payload.schema_version,
-            payload.data_start.isoformat(),
-            payload.data_end.isoformat(),
-            latency_ms,
-            counts["glucose_samples"].received,
-            counts["glucose_samples"].inserted,
-            counts["glucose_samples"].updated,
-            counts["glucose_samples"].unchanged,
-            counts["glucose_samples"].rejected,
-            counts["workouts"].received,
-            counts["workouts"].inserted,
-            counts["workouts"].updated,
-            counts["workouts"].unchanged,
-            counts["workouts"].rejected,
-            counts["sleep_sessions"].received,
-            counts["sleep_sessions"].inserted,
-            counts["sleep_sessions"].updated,
-            counts["sleep_sessions"].unchanged,
-            counts["sleep_sessions"].rejected,
-            counts["weight_measurements"].received,
-            counts["weight_measurements"].inserted,
-            counts["weight_measurements"].updated,
-            counts["weight_measurements"].unchanged,
-            counts["weight_measurements"].rejected,
-            counts["meal_events"].received,
-            counts["meal_events"].inserted,
-            counts["meal_events"].updated,
-            counts["meal_events"].unchanged,
-            counts["meal_events"].rejected,
+            "ingestion_complete %s",
+            " ".join(f"{key}={value}" for key, value in log_fields.items()),
         )
 
         return IngestBatchResponse(
@@ -680,8 +667,10 @@ async def ingest_batch(
                 status="failed",
                 error_summary={"code": "INGESTION_FAILED"},
             )
+        # from None: the original exception is already logged server-side;
+        # do not chain driver details into the sanitized client error.
         raise AppError(
             code="INGESTION_FAILED",
             message="Ingestion could not be completed",
             status_code=500,
-        )
+        ) from None

@@ -2,6 +2,10 @@
 
 Entity-level validation happens in the ingestion service so one bad record
 rejects only that record — not the entire batch or unrelated entity types.
+
+Validators raise PydanticCustomError with a machine-readable error type
+(e.g. INVALID_UNIT); the ingestion service reads it from
+ValidationError.errors()[n]["type"] — no string parsing involved.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from app.schemas.common import NonEmptyStr, UtcDateTime
 
@@ -45,7 +50,7 @@ class GlucoseSampleIn(BaseModel):
     @classmethod
     def unit_must_be_mg_dl(cls, value: str) -> str:
         if value != "mg/dL":
-            raise ValueError("INVALID_UNIT: Glucose unit must be mg/dL")
+            raise PydanticCustomError("INVALID_UNIT", "Glucose unit must be mg/dL")
         return value
 
 
@@ -94,13 +99,17 @@ class WorkoutIn(BaseModel):
     @model_validator(mode="after")
     def validate_workout(self) -> WorkoutIn:
         if self.source_name != "Strava":
-            raise ValueError(
-                "UNSUPPORTED_WORKOUT_SOURCE: Only Strava workouts are accepted"
+            raise PydanticCustomError(
+                "UNSUPPORTED_WORKOUT_SOURCE", "Only Strava workouts are accepted"
             )
         if self.sport != "running":
-            raise ValueError('INVALID_WORKOUT: Phase 1 accepts sport == "running" only.')
+            raise PydanticCustomError(
+                "INVALID_WORKOUT", 'Phase 1 accepts sport == "running" only.'
+            )
         if self.end_time <= self.start_time:
-            raise ValueError("INVALID_WORKOUT: end_time must be after start_time.")
+            raise PydanticCustomError(
+                "INVALID_WORKOUT", "end_time must be after start_time."
+            )
         for field_name in (
             "distance_meters",
             "active_energy_kcal",
@@ -109,8 +118,10 @@ class WorkoutIn(BaseModel):
         ):
             value = getattr(self, field_name)
             if value is not None and value < 0:
-                raise ValueError(
-                    f"INVALID_WORKOUT: {field_name} must be zero or positive when supplied."
+                raise PydanticCustomError(
+                    "INVALID_WORKOUT",
+                    "{field_name} must be zero or positive when supplied.",
+                    {"field_name": field_name},
                 )
         return self
 
@@ -146,7 +157,9 @@ class SleepIntervalIn(BaseModel):
     @model_validator(mode="after")
     def validate_interval(self) -> SleepIntervalIn:
         if self.end_time <= self.start_time:
-            raise ValueError("INVALID_TIMESTAMP: end_time must be after start_time.")
+            raise PydanticCustomError(
+                "INVALID_TIMESTAMP", "end_time must be after start_time."
+            )
         return self
 
 
@@ -180,7 +193,7 @@ class WeightMeasurementIn(BaseModel):
     @classmethod
     def unit_must_be_kg(cls, value: str) -> str:
         if value != "kg":
-            raise ValueError("INVALID_UNIT: Weight unit must be kg")
+            raise PydanticCustomError("INVALID_UNIT", "Weight unit must be kg")
         return value
 
 
@@ -219,10 +232,12 @@ class MealEventIn(BaseModel):
     def normalize_foods(cls, value: Any) -> list[str]:
         if value is None:
             return []
-        if not isinstance(value, list):
-            raise ValueError("INVALID_REQUEST: foods must be a list of strings")
-        if not all(isinstance(item, str) for item in value):
-            raise ValueError("INVALID_REQUEST: foods must be a list of strings")
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise PydanticCustomError(
+                "INVALID_REQUEST", "foods must be a list of strings"
+            )
         return value
 
 
