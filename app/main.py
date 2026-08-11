@@ -42,11 +42,12 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Registered first and dependency-free so Railway healthchecks can pass
+    # Operational probes first so Railway healthchecks and readiness can work
     # even when the rest of the stack is not configured yet.
-    @application.get("/health", tags=["health"])
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    # /health never touches the database; /ready does a minimal SELECT 1.
+    from app.api.v1.health import router as health_router
+
+    application.include_router(health_router)
 
     @application.get("/", include_in_schema=False)
     async def root() -> dict:

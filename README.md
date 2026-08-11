@@ -47,14 +47,25 @@ Future agent tools / MCP harness
 
 | Variable | Required | Description |
 |---|---|---|
-| `DATABASE_URL` | yes | Async Postgres URL (`postgresql+asyncpg://...`) |
+| `DATABASE_URL` | no (boot) / yes (data) | Postgres URL. Optional at process start so `/health` works; required for `/ready` success and data APIs. Railway `postgres://` / `postgresql://` URLs are normalized to async SQLAlchemy. |
 | `INGEST_API_KEY` | yes | Bearer key for ingest endpoints only |
 | `READ_API_KEY` | yes | Bearer key for read/query endpoints only |
 | `ENVIRONMENT` | no | `development` / `test` / `production` |
 | `LOG_LEVEL` | no | Default `INFO` |
 | `CORS_ORIGINS` | no | `*` or comma-separated origins |
 
-Copy `.env.example` to `.env` and edit values. Never commit secrets.
+Copy `.env.example` to `.env` and edit values. Never commit secrets. Do not log `DATABASE_URL`.
+
+## Database readiness
+
+| Endpoint | Meaning |
+|---|---|
+| `GET /health` | Process liveness only. No database dependency, no auth. Always `200` when FastAPI is running: `{"status":"ok"}`. |
+| `GET /ready` | Database availability. Runs `SELECT 1`. Returns `200` with `{"status":"ready","database":"connected"}` when Postgres is reachable; `503` with `DATABASE_UNAVAILABLE` when the URL is missing or the database cannot be reached. Does not expose credentials or raw driver errors. |
+
+Railway supplies `DATABASE_URL` via the Postgres plugin (`DATABASE_URL=${{Postgres.DATABASE_URL}}`).
+
+**Alembic migrations are intentionally not enabled yet** — do not run them on Railway deploy until that step is explicitly rolled out.
 
 ## Local setup
 
@@ -112,7 +123,7 @@ docker compose up --build
 
 - Missing/invalid key → `401 UNAUTHORIZED`
 - Valid key, wrong role → `403 FORBIDDEN`
-- `GET /health` is unauthenticated
+- `GET /health` and `GET /ready` are unauthenticated operational probes
 
 Identity is resolved from auth context as `personal-primary`. Clients must **not** send `user_id`.
 
@@ -139,10 +150,16 @@ Include records at exactly `start`; exclude records at exactly `end`. Maximum ra
 
 ## Example curl commands
 
-### Health check
+### Health check (liveness)
 
 ```bash
 curl http://localhost:8000/health
+```
+
+### Database readiness
+
+```bash
+curl -i http://localhost:8000/ready
 ```
 
 ### Ingest
@@ -255,7 +272,7 @@ Or use the helper in `tests/conftest.py`, which migrates the test database autom
 
 ## Railway deployment
 
-This step is intentionally **API-only**: no Postgres wiring, no Alembic on boot, no ingestion secrets required for the service to become healthy.
+Postgres is provisioned and wired via `DATABASE_URL=${{Postgres.DATABASE_URL}}` plus `ENVIRONMENT=production`. The service boots without connecting at startup; use `/health` for process liveness and `/ready` to confirm database reachability.
 
 **Start command** (must run under a shell so `$PORT` expands):
 
@@ -270,12 +287,12 @@ uvicorn app.main:app --host 0.0.0.0 --port $PORT
 ```
 
 Railway can pass the literal string `$PORT` into uvicorn (which then fails with `'$PORT' is not a valid integer`). Either clear the custom start command (use the Dockerfile `CMD`) or use the `sh -c` form above.
+
 ### Later (not this step)
 
-1. Provision Railway Postgres and set `DATABASE_URL`
-2. Set distinct `INGEST_API_KEY` and `READ_API_KEY`
-3. Run Alembic (`alembic upgrade head`) before or as a separate release step
-4. Authenticated ingest + read verification
+1. Set distinct `INGEST_API_KEY` and `READ_API_KEY`
+2. Enable Alembic migrations (`alembic upgrade head`) as an explicit release step — not on every process boot
+3. Authenticated ingest + read verification
 
 Do not manually edit the Railway production database.
 

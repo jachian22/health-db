@@ -34,3 +34,15 @@ def test_postgres_url_normalization():
     )
     assert settings.sync_database_url.startswith("postgresql://")
     assert settings.async_database_url.startswith("postgresql+asyncpg://")
+
+
+def test_database_url_defaults_to_none():
+    # Blank env values are dropped so the optional default (None) applies,
+    # even if the process environment has a DATABASE_URL from other tests.
+    settings = Settings(
+        DATABASE_URL="",
+        INGEST_API_KEY="key-a",
+        READ_API_KEY="key-b",
+        _env_file=None,
+    )
+    assert settings.database_url is None

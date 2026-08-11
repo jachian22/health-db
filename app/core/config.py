@@ -16,10 +16,9 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    database_url: str = Field(
-        default="postgresql+asyncpg://postgres:postgres@localhost:5432/health_db",
-        alias="DATABASE_URL",
-    )
+    # Optional at import/boot so /health works before Postgres is wired.
+    # Never log the full value — it may contain credentials.
+    database_url: str | None = Field(default=None, alias="DATABASE_URL")
     ingest_api_key: str = Field(default="dev-ingest-key-change-me", alias="INGEST_API_KEY")
     read_api_key: str = Field(default="dev-read-key-change-me", alias="READ_API_KEY")
     environment: str = Field(default="development", alias="ENVIRONMENT")
@@ -72,6 +71,8 @@ class Settings(BaseSettings):
     def sync_database_url(self) -> str:
         """Sync URL for Alembic (psycopg2)."""
         url = self.database_url
+        if not url:
+            raise ValueError("DATABASE_URL is not configured")
         if url.startswith("postgresql+asyncpg://"):
             return url.replace("postgresql+asyncpg://", "postgresql://", 1)
         if url.startswith("postgres://"):
@@ -81,6 +82,8 @@ class Settings(BaseSettings):
     @property
     def async_database_url(self) -> str:
         url = self.database_url
+        if not url:
+            raise ValueError("DATABASE_URL is not configured")
         if url.startswith("postgresql://"):
             return url.replace("postgresql://", "postgresql+asyncpg://", 1)
         if url.startswith("postgres://"):

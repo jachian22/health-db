@@ -20,6 +20,7 @@ async def test_openapi_documents_phase1_contract(client: AsyncClient):
     assert "/v1/query/series/weight" in paths
     assert "/v1/query/events/meals" in paths
     assert "/health" in paths
+    assert "/ready" in paths
 
     # No Phase 2 surfaces
     for banned in ("/v1/summary", "/v1/plan", "/v1/compare"):
