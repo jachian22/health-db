@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "exported_at": "2026-08-10T20:02:50.510Z",
+  "data_start": "2026-07-30T00:00:00.000Z",
+  "data_end": "2026-08-10T20:02:50.369Z",
+  "glucose_samples": [
+    {
+      "source": "apple_health",
+      "source_sample_id": "glucose-sample-0001",
+      "source_name": "Stelo",
+      "sample_time": "2026-08-01T02:05:51.019Z",
+      "value": 95,
+      "unit": "mg/dL",
+      "metadata": {
+        "source_app": "Stelo"
+      }
+    },
+    {
+      "source": "apple_health",
+      "source_sample_id": "glucose-sample-0002",
+      "source_name": "Stelo",
+      "sample_time": "2026-08-01T02:20:51.019Z",
+      "value": 102,
+      "unit": "mg/dL",
+      "metadata": {
+        "source_app": "Stelo"
+      }
+    }
+  ],
+  "workouts": [
+    {
+      "source": "apple_health",
+      "source_sample_id": "workout-sample-0001",
+      "source_name": "Strava",
+      "start_time": "2026-08-10T12:11:31.000Z",
+      "end_time": "2026-08-10T12:57:00.000Z",
+      "sport": "running",
+      "distance_meters": 3647.8,
+      "active_energy_kcal": null,
+      "average_heart_rate": null,
+      "maximum_heart_rate": null,
+      "metadata": {
+        "source_app": "Strava"
+      }
+    }
+  ],
+  "sleep_sessions": [
+    {
+      "source": "apple_health",
+      "source_sample_id": "sleep-sample-0001",
+      "source_name": "Apple Watch",
+      "start_time": "2026-07-30T04:30:36.010Z",
+      "end_time": "2026-07-30T04:50:40.707Z",
+      "stage": "core",
+      "metadata": {
+        "source_app": "Apple Watch"
+      }
+    }
+  ],
+  "weight_measurements": [
+    {
+      "source": "apple_health",
+      "source_sample_id": "weight-sample-0001",
+      "source_name": "Health",
+      "measured_at": "2026-08-10T12:00:00.000Z",
+      "value": "92.714280",
+      "unit": "kg",
+      "metadata": {
+        "source_app": "Health"
+      }
+    }
+  ],
+  "meal_events": [
+    {
+      "source": "manual",
+      "source_sample_id": "meal-sample-0001",
+      "meal_completed_at": "2026-08-10T17:15:00.000Z",
+      "foods": [
+        "One scoop Equip chocolate protein powder",
+        "16 fluid ounces of A2 whole milk"
+      ],
+      "notes": null,
+      "metadata": {}
+    }
+  ]
+}

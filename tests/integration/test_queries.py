@@ -9,8 +9,8 @@ import pytest
 from httpx import AsyncClient
 
 
-async def _seed(client: AsyncClient, ingest_headers: dict, ingest_body: dict) -> None:
-    resp = await client.post("/v1/ingest/batch", headers=ingest_headers, json=ingest_body)
+async def _seed(client: AsyncClient, ingest_headers: dict, seed_body: dict) -> None:
+    resp = await client.post("/v1/ingest/batch", headers=ingest_headers, json=seed_body)
     assert resp.status_code == 200, resp.text
 
 
@@ -19,9 +19,9 @@ async def test_query_auth(
     client: AsyncClient,
     ingest_headers: dict,
     read_headers: dict,
-    ingest_body: dict,
+    query_seed_body: dict,
 ):
-    await _seed(client, ingest_headers, ingest_body)
+    await _seed(client, ingest_headers, query_seed_body)
     body = {
         "start": "2026-08-01T00:00:00Z",
         "end": "2026-08-08T00:00:00Z",
@@ -40,9 +40,9 @@ async def test_half_open_range_and_empty(
     client: AsyncClient,
     ingest_headers: dict,
     read_headers: dict,
-    ingest_body: dict,
+    query_seed_body: dict,
 ):
-    await _seed(client, ingest_headers, ingest_body)
+    await _seed(client, ingest_headers, query_seed_body)
 
     # Fixture glucose at 2026-08-05T14:15:00Z and another sample
     at_start = await client.post(
@@ -113,9 +113,9 @@ async def test_glucose_raw_and_aggregate(
     client: AsyncClient,
     ingest_headers: dict,
     read_headers: dict,
-    ingest_body: dict,
+    query_seed_body: dict,
 ):
-    await _seed(client, ingest_headers, ingest_body)
+    await _seed(client, ingest_headers, query_seed_body)
     raw = await client.post(
         "/v1/query/series/glucose",
         headers=read_headers,
@@ -153,9 +153,9 @@ async def test_runs_sleep_overlap_and_meals_weight(
     client: AsyncClient,
     ingest_headers: dict,
     read_headers: dict,
-    ingest_body: dict,
+    query_seed_body: dict,
 ):
-    await _seed(client, ingest_headers, ingest_body)
+    await _seed(client, ingest_headers, query_seed_body)
 
     # Workout 06:00–06:32 on 2026-08-05 — overlaps window that starts mid-run
     runs = await client.post(
@@ -205,10 +205,10 @@ async def test_request_audit_deferred_without_table(
     client: AsyncClient,
     ingest_headers: dict,
     read_headers: dict,
-    ingest_body: dict,
+    query_seed_body: dict,
 ):
     """Phase 1 omits request_audit_logs; queries must still succeed."""
-    await _seed(client, ingest_headers, ingest_body)
+    await _seed(client, ingest_headers, query_seed_body)
     resp = await client.post(
         "/v1/query/series/glucose",
         headers=read_headers,
@@ -228,9 +228,9 @@ async def test_too_many_rows(
     client: AsyncClient,
     ingest_headers: dict,
     read_headers: dict,
-    ingest_body: dict,
+    query_seed_body: dict,
 ):
-    body = copy.deepcopy(ingest_body)
+    body = copy.deepcopy(query_seed_body)
     # Create many glucose points
     samples = []
     start = datetime(2026, 8, 1, tzinfo=UTC)
@@ -246,7 +246,7 @@ async def test_too_many_rows(
                 "metadata": {},
             }
         )
-    body["payload"]["glucose_samples"] = samples
+    body["glucose_samples"] = samples
     await _seed(client, ingest_headers, body)
 
     resp = await client.post(

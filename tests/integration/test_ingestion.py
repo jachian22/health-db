@@ -11,12 +11,79 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.db.models import (
     GlucoseSample,
+    HealthSource,
     IngestionBatch,
     MealEvent,
     SleepInterval,
+    User,
     WeightMeasurement,
     Workout,
 )
+
+
+@pytest.mark.asyncio
+async def test_ingest_missing_bearer_token(client: AsyncClient, ingest_body: dict):
+    resp = await client.post("/v1/ingest/batch", json=ingest_body)
+    assert resp.status_code == 401
+    body = resp.json()
+    assert body["error"]["code"] == "UNAUTHORIZED"
+    assert body["error"]["message"] == "Invalid or missing ingestion credentials"
+    assert "test-ingest-key" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_ingest_wrong_bearer_token(client: AsyncClient, ingest_body: dict):
+    resp = await client.post(
+        "/v1/ingest/batch",
+        headers={"Authorization": "Bearer wrong-key"},
+        json=ingest_body,
+    )
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "UNAUTHORIZED"
+    assert "wrong-key" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_ingest_read_key_rejected(client: AsyncClient, ingest_body: dict, read_headers: dict):
+    resp = await client.post("/v1/ingest/batch", headers=read_headers, json=ingest_body)
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "UNAUTHORIZED"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_schema_version(
+    client: AsyncClient, ingest_headers: dict, ingest_body: dict
+):
+    body = copy.deepcopy(ingest_body)
+    body["schema_version"] = 99
+    resp = await client.post("/v1/ingest/batch", headers=ingest_headers, json=body)
+    assert resp.status_code == 400
+    err = resp.json()["error"]
+    assert err["code"] == "UNSUPPORTED_SCHEMA_VERSION"
+    assert err["details"]["supported_versions"] == [1]
+
+
+@pytest.mark.asyncio
+async def test_data_end_before_start(
+    client: AsyncClient, ingest_headers: dict, ingest_body: dict
+):
+    body = copy.deepcopy(ingest_body)
+    body["data_start"] = "2026-08-10T20:00:00.000Z"
+    body["data_end"] = "2026-07-30T00:00:00.000Z"
+    resp = await client.post("/v1/ingest/batch", headers=ingest_headers, json=body)
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "INVALID_TIMESTAMP"
+
+
+@pytest.mark.asyncio
+async def test_missing_required_top_level_field(
+    client: AsyncClient, ingest_headers: dict, ingest_body: dict
+):
+    body = copy.deepcopy(ingest_body)
+    del body["schema_version"]
+    resp = await client.post("/v1/ingest/batch", headers=ingest_headers, json=body)
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "INVALID_REQUEST"
 
 
 @pytest.mark.asyncio
@@ -30,11 +97,13 @@ async def test_ingest_fixture_and_replay(
     assert first.status_code == 200, first.text
     body = first.json()
     assert body["status"] == "processed"
-    assert body["results"]["glucose_samples"]["inserted"] == 2
-    assert body["results"]["workouts"]["inserted"] == 1
-    assert body["results"]["sleep_sessions"]["inserted"] == 2
-    assert body["results"]["weight_measurements"]["inserted"] == 1
-    assert body["results"]["meal_events"]["inserted"] == 1
+    assert body["summary"]["glucose_samples"]["inserted"] == 2
+    assert body["summary"]["workouts"]["inserted"] == 1
+    assert body["summary"]["sleep_sessions"]["inserted"] == 1
+    assert body["summary"]["weight_measurements"]["inserted"] == 1
+    assert body["summary"]["meal_events"]["inserted"] == 1
+    assert body["rejections"] == []
+    assert "raw_payload" not in body
 
     async with session_factory() as session:
         batches = (await session.execute(select(func.count()).select_from(IngestionBatch))).scalar()
@@ -42,85 +111,180 @@ async def test_ingest_fixture_and_replay(
         batch = (await session.execute(select(IngestionBatch))).scalar_one()
         assert batch.raw_payload is not None
         assert "glucose_samples" in batch.raw_payload
+
+        user = (
+            await session.execute(
+                select(User).where(User.external_identifier == "personal-primary")
+            )
+        ).scalar_one()
+        assert user is not None
+
+        sources = (
+            await session.execute(select(func.count()).select_from(HealthSource))
+        ).scalar()
+        assert sources >= 1
+
         assert (await session.execute(select(func.count()).select_from(GlucoseSample))).scalar() == 2
         assert (await session.execute(select(func.count()).select_from(Workout))).scalar() == 1
-        assert (await session.execute(select(func.count()).select_from(SleepInterval))).scalar() == 2
+        assert (await session.execute(select(func.count()).select_from(SleepInterval))).scalar() == 1
         assert (await session.execute(select(func.count()).select_from(WeightMeasurement))).scalar() == 1
         assert (await session.execute(select(func.count()).select_from(MealEvent))).scalar() == 1
+
+        glucose = (await session.execute(select(GlucoseSample))).scalars().first()
+        assert glucose.health_source_id is not None
 
     replay = await client.post("/v1/ingest/batch", headers=ingest_headers, json=ingest_body)
     assert replay.status_code == 200
     rbody = replay.json()
-    assert rbody["results"]["glucose_samples"]["unchanged"] == 2
-    assert rbody["results"]["glucose_samples"]["inserted"] == 0
-    assert rbody["results"]["workouts"]["unchanged"] == 1
-    assert rbody["results"]["meal_events"]["unchanged"] == 1
+    assert rbody["status"] == "processed"
+    assert rbody["summary"]["glucose_samples"]["unchanged"] == 2
+    assert rbody["summary"]["glucose_samples"]["inserted"] == 0
+    assert rbody["summary"]["workouts"]["unchanged"] == 1
+    assert rbody["summary"]["sleep_sessions"]["unchanged"] == 1
+    assert rbody["summary"]["weight_measurements"]["unchanged"] == 1
+    assert rbody["summary"]["meal_events"]["unchanged"] == 1
 
     async with session_factory() as session:
         assert (await session.execute(select(func.count()).select_from(GlucoseSample))).scalar() == 2
         assert (await session.execute(select(func.count()).select_from(IngestionBatch))).scalar() == 2
+        sources_after = (
+            await session.execute(select(func.count()).select_from(HealthSource))
+        ).scalar()
+        assert sources_after == sources
 
 
 @pytest.mark.asyncio
-async def test_ingest_update_and_insert(
+async def test_ingest_update_preserves_ingested_at(
     client: AsyncClient,
     ingest_headers: dict[str, str],
     ingest_body: dict,
+    session_factory: async_sessionmaker,
 ):
     await client.post("/v1/ingest/batch", headers=ingest_headers, json=ingest_body)
 
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                select(GlucoseSample).where(
+                    GlucoseSample.source_sample_id == "glucose-sample-0001"
+                )
+            )
+        ).scalar_one()
+        original_ingested_at = row.ingested_at
+        original_updated_at = row.updated_at
+        original_id = row.id
+
     modified = copy.deepcopy(ingest_body)
-    modified["payload"]["glucose_samples"][0]["value"] = 111
-    modified["payload"]["glucose_samples"].append(
-        {
-            "source": "apple_health",
-            "source_name": "Stelo",
-            "source_sample_id": "new-glucose-999",
-            "sample_time": "2026-08-05T15:00:00.000Z",
-            "value": 105,
-            "unit": "mg/dL",
-            "metadata": {},
-        }
-    )
+    modified["glucose_samples"][0]["value"] = 111
+    modified["glucose_samples"][0]["metadata"] = {"source_app": "Stelo", "note": "corrected"}
 
     resp = await client.post("/v1/ingest/batch", headers=ingest_headers, json=modified)
     assert resp.status_code == 200
-    results = resp.json()["results"]["glucose_samples"]
+    results = resp.json()["summary"]["glucose_samples"]
     assert results["updated"] == 1
-    assert results["inserted"] == 1
     assert results["unchanged"] == 1
+    assert results["inserted"] == 0
+
+    async with session_factory() as session:
+        rows = (
+            await session.execute(select(func.count()).select_from(GlucoseSample))
+        ).scalar()
+        assert rows == 2
+        row = (
+            await session.execute(
+                select(GlucoseSample).where(
+                    GlucoseSample.source_sample_id == "glucose-sample-0001"
+                )
+            )
+        ).scalar_one()
+        assert row.id == original_id
+        assert float(row.value_mg_dl) == 111.0
+        assert row.ingested_at == original_ingested_at
+        assert row.updated_at > original_updated_at
 
 
 @pytest.mark.asyncio
-async def test_invalid_glucose_does_not_block_meals(
+async def test_invalid_weight_unit_partial_success(
     client: AsyncClient,
     ingest_headers: dict[str, str],
     ingest_body: dict,
     session_factory: async_sessionmaker,
 ):
     body = copy.deepcopy(ingest_body)
-    body["payload"]["glucose_samples"].append(
-        {
-            "source": "apple_health",
-            "source_sample_id": "bad-glucose",
-            "sample_time": "2026-08-05T16:00:00.000Z",
-            "value": 90,
-            "unit": "mmol/L",
-        }
-    )
+    body["weight_measurements"][0]["unit"] = "lb"
 
     resp = await client.post("/v1/ingest/batch", headers=ingest_headers, json=body)
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "partial"
-    assert data["results"]["glucose_samples"]["rejected"] == 1
-    assert data["results"]["meal_events"]["inserted"] == 1
-    assert any(r["code"] == "INVALID_UNIT" for r in data["rejections"])
+    assert data["summary"]["weight_measurements"]["rejected"] == 1
+    assert data["summary"]["glucose_samples"]["inserted"] == 2
+    assert data["summary"]["meal_events"]["inserted"] == 1
+    rejection = next(r for r in data["rejections"] if r["code"] == "INVALID_UNIT")
+    assert rejection["entity_type"] == "weight_measurements"
+    assert rejection["index"] == 0
+    assert "lb" not in rejection.get("message", "").lower() or "kg" in rejection["message"]
 
     async with session_factory() as session:
+        assert (
+            await session.execute(select(func.count()).select_from(WeightMeasurement))
+        ).scalar() == 0
         assert (await session.execute(select(func.count()).select_from(MealEvent))).scalar() == 1
-        # only the two valid glucose rows
+
+
+@pytest.mark.asyncio
+async def test_non_strava_workout_rejected(
+    client: AsyncClient,
+    ingest_headers: dict[str, str],
+    ingest_body: dict,
+    session_factory: async_sessionmaker,
+):
+    body = copy.deepcopy(ingest_body)
+    body["workouts"][0]["source_name"] = "Apple Watch"
+
+    resp = await client.post("/v1/ingest/batch", headers=ingest_headers, json=body)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "partial"
+    assert data["summary"]["workouts"]["rejected"] == 1
+    assert data["summary"]["glucose_samples"]["inserted"] == 2
+    assert any(r["code"] == "UNSUPPORTED_WORKOUT_SOURCE" for r in data["rejections"])
+
+    async with session_factory() as session:
+        assert (await session.execute(select(func.count()).select_from(Workout))).scalar() == 0
         assert (await session.execute(select(func.count()).select_from(GlucoseSample))).scalar() == 2
+
+
+@pytest.mark.asyncio
+async def test_meal_completed_at_accepted(
+    client: AsyncClient,
+    ingest_headers: dict[str, str],
+    ingest_body: dict,
+):
+    resp = await client.post("/v1/ingest/batch", headers=ingest_headers, json=ingest_body)
+    assert resp.status_code == 200
+    assert resp.json()["summary"]["meal_events"]["inserted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_meal_start_end_rejected(
+    client: AsyncClient,
+    ingest_headers: dict[str, str],
+    ingest_body: dict,
+    session_factory: async_sessionmaker,
+):
+    body = copy.deepcopy(ingest_body)
+    body["meal_events"][0]["meal_start"] = "2026-08-10T17:00:00.000Z"
+
+    resp = await client.post("/v1/ingest/batch", headers=ingest_headers, json=body)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "partial"
+    assert data["summary"]["meal_events"]["rejected"] == 1
+    assert any(r["code"] == "INVALID_REQUEST" for r in data["rejections"])
+
+    async with session_factory() as session:
+        assert (await session.execute(select(func.count()).select_from(MealEvent))).scalar() == 0
 
 
 @pytest.mark.asyncio
@@ -131,14 +295,12 @@ async def test_duplicate_identity_in_payload_applies_last(
     session_factory: async_sessionmaker,
 ):
     body = copy.deepcopy(ingest_body)
-    first = copy.deepcopy(body["payload"]["glucose_samples"][0])
+    first = copy.deepcopy(body["glucose_samples"][0])
     first["value"] = 200
-    body["payload"]["glucose_samples"].append(first)
+    body["glucose_samples"].append(first)
 
     resp = await client.post("/v1/ingest/batch", headers=ingest_headers, json=body)
     assert resp.status_code == 200
-    data = resp.json()
-    assert any("duplicate" in w for w in data["warnings"])
 
     async with session_factory() as session:
         row = (
@@ -152,7 +314,7 @@ async def test_duplicate_identity_in_payload_applies_last(
 
 
 @pytest.mark.asyncio
-async def test_upsert_failure_marks_batch_failed(
+async def test_upsert_failure_returns_sanitized_ingestion_failed(
     client: AsyncClient,
     ingest_headers: dict[str, str],
     ingest_body: dict,
@@ -162,14 +324,17 @@ async def test_upsert_failure_marks_batch_failed(
     from app.services import ingestion as ingestion_module
 
     async def _boom(*args, **kwargs):
-        raise RuntimeError("simulated upsert failure")
+        raise RuntimeError("simulated upsert failure with secret DSN postgresql://x")
 
     monkeypatch.setattr(ingestion_module, "_upsert_entity", _boom)
 
-    # httpx's ASGI transport re-raises unhandled app exceptions rather than
-    # returning the 500 JSON body, so assert on the propagated error here.
-    with pytest.raises(RuntimeError, match="simulated upsert failure"):
-        await client.post("/v1/ingest/batch", headers=ingest_headers, json=ingest_body)
+    resp = await client.post("/v1/ingest/batch", headers=ingest_headers, json=ingest_body)
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["error"]["code"] == "INGESTION_FAILED"
+    assert "simulated" not in resp.text
+    assert "postgresql://" not in resp.text
+    assert "DATABASE_URL" not in resp.text
 
     async with session_factory() as session:
         batch = (await session.execute(select(IngestionBatch))).scalar_one()
@@ -177,16 +342,14 @@ async def test_upsert_failure_marks_batch_failed(
 
 
 @pytest.mark.asyncio
-async def test_ingest_requires_ingest_key(
+async def test_response_excludes_secrets(
     client: AsyncClient,
-    read_headers: dict[str, str],
+    ingest_headers: dict[str, str],
     ingest_body: dict,
 ):
-    missing = await client.post("/v1/ingest/batch", json=ingest_body)
-    assert missing.status_code == 401
-
-    wrong_role = await client.post(
-        "/v1/ingest/batch", headers=read_headers, json=ingest_body
-    )
-    assert wrong_role.status_code == 403
-    assert wrong_role.json()["error"]["code"] == "FORBIDDEN"
+    resp = await client.post("/v1/ingest/batch", headers=ingest_headers, json=ingest_body)
+    assert resp.status_code == 200
+    text = resp.text
+    assert "test-ingest-key" not in text
+    assert "DATABASE_URL" not in text
+    assert "postgresql" not in text.lower()

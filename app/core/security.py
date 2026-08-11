@@ -38,14 +38,26 @@ def _extract_bearer(
     return token or None
 
 
-def _match_role(token: str, settings: Settings) -> AuthRole | None:
-    # Settings enforces at startup that the two keys are distinct,
-    # so at most one comparison can match.
-    if secrets.compare_digest(token, settings.ingest_api_key):
-        return AuthRole.INGEST
-    if secrets.compare_digest(token, settings.read_api_key):
-        return AuthRole.READ
-    return None
+async def require_ingest_auth(
+    request: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> AuthContext:
+    """Authenticate POST /v1/ingest/batch with INGEST_API_KEY only."""
+    token = _extract_bearer(credentials)
+    if token is None or not secrets.compare_digest(token, settings.ingest_api_key):
+        raise AppError(
+            code="UNAUTHORIZED",
+            message="Invalid or missing ingestion credentials",
+            status_code=401,
+        )
+    ctx = AuthContext(
+        role=AuthRole.INGEST,
+        external_user_id=settings.primary_user_external_id,
+    )
+    request.state.auth_role = ctx.role.value
+    request.state.external_user_id = ctx.external_user_id
+    return ctx
 
 
 async def resolve_auth(
@@ -57,15 +69,18 @@ async def resolve_auth(
     if token is None:
         raise AppError(
             code="UNAUTHORIZED",
-            message="Missing or malformed Authorization header.",
+            message="Invalid or missing credentials",
             hint="Send Authorization: Bearer <api-key>.",
             status_code=401,
         )
-    role = _match_role(token, settings)
-    if role is None:
+    if secrets.compare_digest(token, settings.ingest_api_key):
+        role = AuthRole.INGEST
+    elif secrets.compare_digest(token, settings.read_api_key):
+        role = AuthRole.READ
+    else:
         raise AppError(
             code="UNAUTHORIZED",
-            message="Invalid API key.",
+            message="Invalid or missing credentials",
             status_code=401,
         )
     ctx = AuthContext(role=role, external_user_id=settings.primary_user_external_id)
@@ -90,5 +105,5 @@ def require_role(*allowed: AuthRole):
     return _dependency
 
 
-RequireIngest = Annotated[AuthContext, Depends(require_role(AuthRole.INGEST))]
+RequireIngest = Annotated[AuthContext, Depends(require_ingest_auth)]
 RequireRead = Annotated[AuthContext, Depends(require_role(AuthRole.READ))]

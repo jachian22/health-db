@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 from pydantic import ValidationError
 
@@ -18,12 +20,10 @@ from app.schemas.export import (
 
 def _base_payload(**overrides):
     data = {
-        "complete": True,
         "schema_version": 1,
         "exported_at": "2026-08-10T20:00:00Z",
         "data_start": "2026-07-30T00:00:00Z",
         "data_end": "2026-08-10T20:00:00Z",
-        "errors": [],
         "glucose_samples": [],
         "workouts": [],
         "sleep_sessions": [],
@@ -45,13 +45,15 @@ def test_unsupported_schema_version_rejected():
     with pytest.raises(AppError) as exc:
         payload.enforce_phase1_contract()
     assert exc.value.code == "UNSUPPORTED_SCHEMA_VERSION"
+    assert exc.value.details == {"supported_versions": [1]}
 
 
-def test_incomplete_export_rejected():
-    payload = HealthExportPayload.model_validate(_base_payload(complete=False))
-    with pytest.raises(AppError) as exc:
-        payload.enforce_phase1_contract()
-    assert exc.value.code == "INCOMPLETE_EXPORT"
+def test_unknown_optional_top_level_keys_ignored():
+    payload = HealthExportPayload.model_validate(
+        _base_payload(complete=True, errors=[], export_id="ignored")
+    )
+    payload.enforce_phase1_contract()
+    assert payload.schema_version == 1
 
 
 def test_data_end_before_start_rejected():
@@ -79,6 +81,20 @@ def test_glucose_unit_other_than_mg_dl_rejected():
         )
 
 
+def test_glucose_value_uses_decimal():
+    sample = GlucoseSampleIn.model_validate(
+        {
+            "source": "apple_health",
+            "source_sample_id": "g1",
+            "sample_time": "2026-08-01T00:00:00Z",
+            "value": "95.5",
+            "unit": "mg/dL",
+        }
+    )
+    assert isinstance(sample.value, Decimal)
+    assert sample.value == Decimal("95.5")
+
+
 def test_weight_unit_other_than_kg_rejected():
     with pytest.raises(ValidationError):
         WeightMeasurementIn.model_validate(
@@ -99,6 +115,18 @@ def test_meal_missing_completed_at_rejected():
                 "source": "manual",
                 "source_sample_id": "m1",
                 "foods": ["eggs"],
+            }
+        )
+
+
+def test_meal_start_forbidden():
+    with pytest.raises(ValidationError):
+        MealEventIn.model_validate(
+            {
+                "source": "manual",
+                "source_sample_id": "m1",
+                "meal_completed_at": "2026-08-01T12:00:00Z",
+                "meal_start": "2026-08-01T11:00:00Z",
             }
         )
 
@@ -126,7 +154,7 @@ def test_missing_meal_notes_normalizes_to_null():
     assert meal.notes is None
 
 
-def test_invalid_sleep_stage_maps_to_unknown():
+def test_unknown_sleep_stage_preserved():
     sleep = SleepIntervalIn.model_validate(
         {
             "source": "apple_health",
@@ -136,8 +164,7 @@ def test_invalid_sleep_stage_maps_to_unknown():
             "stage": "light",
         }
     )
-    assert sleep.stage == "unknown"
-    assert sleep.stage_warning is not None
+    assert sleep.stage == "light"
 
 
 def test_workout_end_before_start_rejected():
@@ -145,6 +172,7 @@ def test_workout_end_before_start_rejected():
         WorkoutIn.model_validate(
             {
                 "source": "apple_health",
+                "source_name": "Strava",
                 "source_sample_id": "r1",
                 "sport": "running",
                 "start_time": "2026-08-01T02:00:00Z",
@@ -158,9 +186,25 @@ def test_non_running_workout_rejected():
         WorkoutIn.model_validate(
             {
                 "source": "apple_health",
+                "source_name": "Strava",
                 "source_sample_id": "r1",
                 "sport": "cycling",
                 "start_time": "2026-08-01T01:00:00Z",
                 "end_time": "2026-08-01T02:00:00Z",
             }
         )
+
+
+def test_non_strava_workout_rejected():
+    with pytest.raises(ValidationError) as exc:
+        WorkoutIn.model_validate(
+            {
+                "source": "apple_health",
+                "source_name": "Nike Run Club",
+                "source_sample_id": "r1",
+                "sport": "running",
+                "start_time": "2026-08-01T01:00:00Z",
+                "end_time": "2026-08-01T02:00:00Z",
+            }
+        )
+    assert "UNSUPPORTED_WORKOUT_SOURCE" in str(exc.value)

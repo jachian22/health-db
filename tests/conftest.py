@@ -35,7 +35,8 @@ from app.core.config import get_settings  # noqa: E402
 from app.db.session import dispose_engine  # noqa: E402
 from app.main import create_app  # noqa: E402
 
-FIXTURE_PATH = Path(__file__).parent / "fixtures" / "health_export_fixture.json"
+MINIMAL_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "health_export_minimal.json"
+QUERY_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "health_export_fixture.json"
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -149,9 +150,16 @@ def read_headers() -> dict[str, str]:
 
 @pytest.fixture
 def export_fixture() -> dict:
-    return json.loads(FIXTURE_PATH.read_text())
+    return json.loads(MINIMAL_FIXTURE_PATH.read_text())
 
 
 @pytest.fixture
 def ingest_body(export_fixture: dict) -> dict:
-    return {"payload": export_fixture}
+    """iOS export object accepted directly as the ingest request body."""
+    return export_fixture
+
+
+@pytest.fixture
+def query_seed_body() -> dict:
+    """Richer fixture used by query integration tests."""
+    return json.loads(QUERY_FIXTURE_PATH.read_text())
