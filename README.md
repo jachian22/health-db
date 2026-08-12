@@ -1,46 +1,34 @@
 # Health Data Platform — Phase 1
 
-Personal FastAPI + PostgreSQL service that ingests an iOS HealthKit export, stores normalized health data idempotently, and exposes a narrow authenticated read API for later agent consumption.
+Personal FastAPI + PostgreSQL service that ingests an iOS HealthKit export, stores normalized health data idempotently, and exposes Query API v1 (authenticated, read-only) for later MCP/agent access.
 
 ## What Phase 1 does
 
 - Accept version-1 iOS export payloads via `POST /v1/ingest/batch`
 - Store one raw payload copy per ingestion batch (audit/debug)
 - Upsert typed rows keyed by `(user_id, source, source_sample_id)`
-- Expose bounded read endpoints for glucose, runs, sleep intervals, weight, and meals
-- Separate ingest and read API keys
-- Request ID on every response (persistent request-audit storage is deferred to a later phase)
+- Expose Query API v1: `coverage`, `glucose/series`, `glucose/summary`, `meals`
+- Separate ingest (`INGEST_API_KEY`) and read (`READ_API_KEY`) credentials
+- Request ID on every response (persistent request-audit storage is deferred)
 
 ## What Phase 1 does **not** do
 
 - Direct HealthKit access, iOS upload, OAuth, or multi-user product flows
-- MCP / planner / compare / daily-weekly summary endpoints
+- MCP server, agent orchestration, charts/UI
+- Workout / sleep / weight Query API routes (coverage reports existence only)
 - Arbitrary SQL or natural-language → SQL
 - Sleep sessionization, fasting windows, meal-response derivation
-- Charts or UI
-- Railway deployment (repo is ready; deploy is deferred)
+- Meal notes in Query API responses
 
 ## Architecture
 
 ```text
-Future iOS exporter
-      |
-      | POST /v1/ingest/batch
-      v
-FastAPI service
-      |
-      | validate, report, upsert
-      v
-PostgreSQL
-      |
-      +-- ingestion_batches (audit/debug)
-      +-- typed health records
-      |
-      v
-Authenticated read API
-      |
-      v
-Future agent tools / MCP harness
+iPhone app
+→ POST /v1/ingest/batch
+→ Railway Postgres
+→ GET /v1/query/*
+→ future MCP server
+→ agent / visualization client
 ```
 
 ## Environment variables
@@ -119,13 +107,26 @@ docker compose up --build
 | Key | Role | Access |
 |---|---|---|
 | `INGEST_API_KEY` | `ingest` | `POST /v1/ingest/batch` only |
-| `READ_API_KEY` | `read` | `/v1/query/...` only |
+| `READ_API_KEY` | `read` | `GET /v1/query/*` only |
 
 - Missing/invalid key → `401 UNAUTHORIZED`
-- Valid key, wrong role → `403 FORBIDDEN`
+- Keys are **not** interchangeable (`INGEST_API_KEY` cannot call Query API; `READ_API_KEY` cannot ingest)
 - `GET /health` and `GET /ready` are unauthenticated operational probes
 
-Identity is resolved from auth context as `personal-primary`. Clients must **not** send `user_id`.
+Identity is resolved server-side as `personal-primary`. Clients must **not** send `user_id`.
+
+## Query API v1
+
+All query endpoints are **read-only** and require explicit bounded time ranges (`start`, `end` as timezone-aware ISO-8601). Windows are half-open `[start, end)`. Default timezone: `America/New_York`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/v1/query/coverage` | Counts + first/last per dataset |
+| GET | `/v1/query/glucose/series` | Raw or aggregated glucose (`raw`/`5m`/`15m`/`hourly`) |
+| GET | `/v1/query/glucose/summary` | Overall or daily descriptive stats |
+| GET | `/v1/query/meals` | Meals with foods (notes excluded); cursor pagination |
+
+Glucose resolution hard limits: raw 7d, 5m 31d, 15m 90d, hourly 365d (oversized ranges rejected). Meals default `limit=100`, max `500`.
 
 ## Idempotency
 
@@ -140,13 +141,13 @@ Record identity: `(user_id, source, source_sample_id)`.
 
 ## Range semantics
 
-All time-range queries use half-open windows:
+Query API time-range queries use half-open windows:
 
 ```text
 [start, end)
 ```
 
-Include records at exactly `start`; exclude records at exactly `end`. Maximum range: **365 days**. Default row cap: **5000**. Hard cap: **20000**. Overflow returns `TOO_MANY_ROWS` (never silent truncation).
+Include records at exactly `start`; exclude records at exactly `end`. Glucose series additionally enforces per-resolution maximum spans (see above). Meal pages never silently truncate: when more rows remain, `truncated=true` and `next_cursor` are returned.
 
 ## Example curl commands
 
@@ -187,67 +188,36 @@ curl -X POST http://localhost:8000/v1/ingest/batch \
 EOF
 ```
 
-### Glucose query
+### Coverage
 
 ```bash
-curl -X POST http://localhost:8000/v1/query/series/glucose \
-  -H "Authorization: Bearer $READ_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "start": "2026-08-01T00:00:00Z",
-    "end": "2026-08-08T00:00:00Z",
-    "resolution": "raw",
-    "limit": 5000
-  }'
+curl -sS \
+  "http://127.0.0.1:8000/v1/query/coverage?start=2026-08-01T00:00:00Z&end=2026-08-12T00:00:00Z" \
+  -H "Authorization: Bearer $READ_API_KEY" | python -m json.tool
 ```
 
-### Runs query
+### Glucose series
 
 ```bash
-curl -X POST http://localhost:8000/v1/query/series/runs \
-  -H "Authorization: Bearer $READ_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "start": "2026-08-01T00:00:00Z",
-    "end": "2026-08-08T00:00:00Z"
-  }'
+curl -sS \
+  "http://127.0.0.1:8000/v1/query/glucose/series?start=2026-08-01T00:00:00Z&end=2026-08-07T00:00:00Z&resolution=raw" \
+  -H "Authorization: Bearer $READ_API_KEY" | python -m json.tool
 ```
 
-### Sleep query
+### Glucose summary
 
 ```bash
-curl -X POST http://localhost:8000/v1/query/series/sleep \
-  -H "Authorization: Bearer $READ_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "start": "2026-08-01T00:00:00Z",
-    "end": "2026-08-08T00:00:00Z",
-    "stages": ["core", "deep", "rem", "awake"]
-  }'
+curl -sS \
+  "http://127.0.0.1:8000/v1/query/glucose/summary?start=2026-08-01T00:00:00Z&end=2026-08-07T00:00:00Z&bucket=overall" \
+  -H "Authorization: Bearer $READ_API_KEY" | python -m json.tool
 ```
 
-### Weight query
+### Meals
 
 ```bash
-curl -X POST http://localhost:8000/v1/query/series/weight \
-  -H "Authorization: Bearer $READ_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "start": "2026-08-01T00:00:00Z",
-    "end": "2026-08-08T00:00:00Z"
-  }'
-```
-
-### Meals query
-
-```bash
-curl -X POST http://localhost:8000/v1/query/events/meals \
-  -H "Authorization: Bearer $READ_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "start": "2026-08-01T00:00:00Z",
-    "end": "2026-08-08T00:00:00Z"
-  }'
+curl -sS \
+  "http://127.0.0.1:8000/v1/query/meals?start=2026-08-01T00:00:00Z&end=2026-08-12T00:00:00Z" \
+  -H "Authorization: Bearer $READ_API_KEY" | python -m json.tool
 ```
 
 ## Data privacy / logging policy

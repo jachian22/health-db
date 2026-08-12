@@ -29,14 +29,17 @@ def create_app() -> FastAPI:
     application = FastAPI(
         title="Health Data Platform",
         description=(
-            "Phase 1 — ingest and retrieve personal health data for later agent consumption.\n\n"
+            "Personal health data platform — ingest (iOS) and Query API v1 "
+            "(authenticated read-only contract for future MCP/agent access).\n\n"
             "## Semantics\n"
-            "- All timestamps are UTC.\n"
-            "- Range queries use half-open `[start, end)` windows.\n"
-            "- Maximum query range: 365 days.\n"
-            "- Default row cap: 5000; hard cap: 20000 (never silently truncated).\n"
-            "- Weight is stored and returned in kilograms.\n"
-            "- Glucose is stored and returned in mg/dL.\n"
+            "- All source timestamps are stored and returned in UTC.\n"
+            "- Query API ranges are half-open `[start, end)` and require timezone-aware "
+            "ISO-8601 `start` / `end` parameters.\n"
+            "- Default display/aggregation timezone: `America/New_York`.\n"
+            "- All query endpoints are read-only and require explicit bounded time ranges.\n"
+            "- Glucose units: mg/dL. Weight units: kg.\n"
+            "- Query API uses `READ_API_KEY`; ingest uses `INGEST_API_KEY` "
+            "(keys are not interchangeable).\n"
         ),
         version=__version__,
         lifespan=lifespan,
@@ -76,7 +79,7 @@ def _mount_phase1(application: FastAPI) -> None:
     from starlette.requests import Request
 
     from app.api.errors import AppError, app_error_handler
-    from app.api.v1 import events, ingest, series
+    from app.api.v1 import ingest, query
     from app.core.config import get_settings
     from app.core.request_id import RequestIdMiddleware
 
@@ -144,8 +147,7 @@ def _mount_phase1(application: FastAPI) -> None:
         )
 
     application.include_router(ingest.router)
-    application.include_router(series.router)
-    application.include_router(events.router)
+    application.include_router(query.router)
     logger.info("phase1_wiring_complete")
 
 

@@ -9,6 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./

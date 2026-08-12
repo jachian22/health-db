@@ -1,54 +1,49 @@
-"""Bounded typed read queries over stored health data."""
+"""HealthDataQueryService — bounded typed read queries over stored health data.
+
+Independent of MCP / agent transport. Callers authenticate separately and resolve
+the fixed personal principal via settings.primary_user_external_id.
+"""
 
 from __future__ import annotations
 
+import base64
+import binascii
+import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import RESOLUTION_SECONDS
+from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.db.models import GlucoseSample, MealEvent, SleepInterval, User, WeightMeasurement, Workout
 from app.schemas.queries import (
-    GlucoseSeriesQuery,
-    MealsQuery,
-    RangeQuery,
-    RunsSeriesQuery,
-    SleepSeriesQuery,
-    WeightSeriesQuery,
+    enforce_glucose_range_limit,
+    parse_timezone,
+    validate_glucose_resolution,
+    validate_meal_limit,
+    validate_summary_bucket,
+    validate_time_range,
 )
 from app.schemas.responses import (
+    CoverageCategory,
+    CoverageMap,
+    CoverageResponse,
     GlucoseBucketPoint,
+    GlucoseDailySummary,
     GlucoseRawPoint,
-    MealPoint,
-    QueryMeta,
-    QueryResponse,
-    RunPoint,
-    SleepPoint,
-    WeightPoint,
+    GlucoseSeriesResponse,
+    GlucoseSummaryResponse,
+    GlucoseSummaryStats,
+    MealItem,
+    MealsResponse,
 )
 
-
-async def resolve_user(session: AsyncSession, external_id: str) -> User:
-    result = await session.execute(
-        select(User).where(User.external_identifier == external_id)
-    )
-    user = result.scalar_one_or_none()
-    if user is None:
-        raise AppError(
-            code="INTERNAL_ERROR",
-            message=f"Primary user '{external_id}' is not seeded.",
-            status_code=500,
-        )
-    return user
-
-
-def _duration_seconds(start: datetime, end: datetime) -> int:
-    return int((end - start).total_seconds())
+logger = logging.getLogger("app.query")
 
 
 def _dec(value: Any) -> float | None:
@@ -59,284 +54,507 @@ def _dec(value: Any) -> float | None:
     return float(value)
 
 
-async def _fetch_with_cap(
-    session: AsyncSession,
-    stmt: Select[Any],
-    limit: int,
-) -> list[Any]:
-    capped = await session.execute(stmt.limit(limit + 1))
-    rows = list(capped.scalars().all())
-    if len(rows) > limit:
+def _round_mg_dl(value: float | None, *, places: int = 1) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), places)
+
+
+def _ensure_aware(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _encode_meal_cursor(completed_at: datetime, source_sample_id: str) -> str:
+    stamp = _ensure_aware(completed_at).isoformat().replace("+00:00", "Z")
+    raw = f"{stamp}|{source_sample_id}".encode()
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_meal_cursor(cursor: str) -> tuple[datetime, str]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+        stamp, source_sample_id = raw.split("|", 1)
+        if not source_sample_id:
+            raise ValueError("empty source_sample_id")
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("naive cursor timestamp")
+        return parsed.astimezone(UTC), source_sample_id
+    except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
         raise AppError(
-            code="TOO_MANY_ROWS",
-            message=f"Query matched more than {limit} rows.",
-            hint=(
-                "Narrow the time range, lower the limit, or for glucose use an "
-                "aggregated resolution (5m, 15m, 1h, 1d)."
-            ),
-            status_code=400,
+            code="INVALID_CURSOR",
+            message="cursor is malformed or invalid",
+            status_code=422,
+        ) from exc
+
+
+class HealthDataQueryService:
+    """Read-only query surface for the personal-primary health dataset."""
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        settings: Settings | None = None,
+    ) -> None:
+        self.session = session
+        self.settings = settings or get_settings()
+
+    async def resolve_personal_user(self) -> User:
+        external_id = self.settings.primary_user_external_id
+        result = await self.session.execute(
+            select(User).where(User.external_identifier == external_id)
         )
-    return rows
+        user = result.scalar_one_or_none()
+        if user is None:
+            raise AppError(
+                code="QUERY_FAILED",
+                message="The requested health data could not be retrieved",
+                status_code=500,
+            )
+        return user
 
+    async def coverage(
+        self,
+        *,
+        request_id: str,
+        start: datetime,
+        end: datetime,
+        timezone: str | None,
+    ) -> CoverageResponse:
+        start_utc, end_utc = validate_time_range(start, end)
+        tz_name = parse_timezone(timezone)
+        user = await self.resolve_personal_user()
 
-def _empty_response(query: RangeQuery, warnings: list[str] | None = None) -> QueryResponse:
-    return QueryResponse(
-        data=[],
-        meta=QueryMeta(
-            requested_start=query.start,
-            requested_end=query.end,
-            actual_first_record_at=None,
-            actual_last_record_at=None,
-            row_count=0,
-            timezone="UTC",
-        ),
-        warnings=warnings or [],
-        next_cursor=None,
-    )
+        glucose = await self._coverage_for(
+            GlucoseSample.sample_time,
+            GlucoseSample.user_id == user.id,
+            GlucoseSample.deleted_at.is_(None),
+            GlucoseSample.sample_time >= start_utc,
+            GlucoseSample.sample_time < end_utc,
+        )
+        meals = await self._coverage_for(
+            MealEvent.meal_completed_at,
+            MealEvent.user_id == user.id,
+            MealEvent.deleted_at.is_(None),
+            MealEvent.meal_completed_at >= start_utc,
+            MealEvent.meal_completed_at < end_utc,
+        )
+        workouts = await self._coverage_for(
+            Workout.start_time,
+            Workout.user_id == user.id,
+            Workout.deleted_at.is_(None),
+            Workout.start_time >= start_utc,
+            Workout.start_time < end_utc,
+        )
+        sleep = await self._coverage_for(
+            SleepInterval.start_time,
+            SleepInterval.user_id == user.id,
+            SleepInterval.deleted_at.is_(None),
+            SleepInterval.start_time >= start_utc,
+            SleepInterval.start_time < end_utc,
+        )
+        weight = await self._coverage_for(
+            WeightMeasurement.measured_at,
+            WeightMeasurement.user_id == user.id,
+            WeightMeasurement.deleted_at.is_(None),
+            WeightMeasurement.measured_at >= start_utc,
+            WeightMeasurement.measured_at < end_utc,
+        )
 
+        return CoverageResponse(
+            request_id=request_id,
+            start=start_utc,
+            end=end_utc,
+            timezone=tz_name,
+            coverage=CoverageMap(
+                glucose=glucose,
+                meals=meals,
+                workouts=workouts,
+                sleep_intervals=sleep,
+                weight_measurements=weight,
+            ),
+        )
 
-def _response(
-    query: RangeQuery,
-    data: list[Any],
-    first_at: datetime | None,
-    last_at: datetime | None,
-    warnings: list[str] | None = None,
-) -> QueryResponse:
-    return QueryResponse(
-        data=data,
-        meta=QueryMeta(
-            requested_start=query.start,
-            requested_end=query.end,
-            actual_first_record_at=first_at,
-            actual_last_record_at=last_at,
-            row_count=len(data),
-            timezone="UTC",
-        ),
-        warnings=warnings or [],
-        next_cursor=None,
-    )
+    async def glucose_series(
+        self,
+        *,
+        request_id: str,
+        start: datetime,
+        end: datetime,
+        resolution: str,
+        timezone: str | None,
+    ) -> GlucoseSeriesResponse:
+        start_utc, end_utc = validate_time_range(start, end)
+        tz_name = parse_timezone(timezone)
+        resolution = validate_glucose_resolution(resolution)
+        enforce_glucose_range_limit(start_utc, end_utc, resolution)
+        user = await self.resolve_personal_user()
 
+        if resolution == "raw":
+            return await self._glucose_raw(
+                request_id=request_id,
+                user_id=user.id,
+                start=start_utc,
+                end=end_utc,
+                timezone=tz_name,
+            )
+        return await self._glucose_aggregated(
+            request_id=request_id,
+            user_id=user.id,
+            start=start_utc,
+            end=end_utc,
+            timezone=tz_name,
+            resolution=resolution,
+        )
 
-async def query_glucose(
-    session: AsyncSession,
-    user_id: uuid.UUID,
-    query: GlucoseSeriesQuery,
-) -> QueryResponse:
-    query.enforce_bounds()
-    limit = query.effective_limit()
+    async def glucose_summary(
+        self,
+        *,
+        request_id: str,
+        start: datetime,
+        end: datetime,
+        timezone: str | None,
+        bucket: str,
+    ) -> GlucoseSummaryResponse:
+        start_utc, end_utc = validate_time_range(start, end)
+        tz_name = parse_timezone(timezone)
+        bucket = validate_summary_bucket(bucket)
+        user = await self.resolve_personal_user()
 
-    if query.resolution == "raw":
+        if bucket == "overall":
+            summary = await self._glucose_overall_summary(user.id, start_utc, end_utc)
+            return GlucoseSummaryResponse(
+                request_id=request_id,
+                start=start_utc,
+                end=end_utc,
+                timezone=tz_name,
+                bucket="overall",
+                summary=summary,
+                days=None,
+            )
+
+        days = await self._glucose_daily_summary(user.id, start_utc, end_utc, tz_name)
+        return GlucoseSummaryResponse(
+            request_id=request_id,
+            start=start_utc,
+            end=end_utc,
+            timezone=tz_name,
+            bucket="daily",
+            summary=None,
+            days=days,
+        )
+
+    async def meals(
+        self,
+        *,
+        request_id: str,
+        start: datetime,
+        end: datetime,
+        timezone: str | None,
+        limit: int | None,
+        cursor: str | None,
+    ) -> MealsResponse:
+        start_utc, end_utc = validate_time_range(start, end)
+        tz_name = parse_timezone(timezone)
+        page_size = validate_meal_limit(limit)
+        user = await self.resolve_personal_user()
+
+        conditions = [
+            MealEvent.user_id == user.id,
+            MealEvent.deleted_at.is_(None),
+            MealEvent.meal_completed_at >= start_utc,
+            MealEvent.meal_completed_at < end_utc,
+        ]
+        if cursor:
+            cursor_at, cursor_id = _decode_meal_cursor(cursor)
+            conditions.append(
+                (MealEvent.meal_completed_at > cursor_at)
+                | (
+                    (MealEvent.meal_completed_at == cursor_at)
+                    & (MealEvent.source_sample_id > cursor_id)
+                )
+            )
+
+        stmt = (
+            select(MealEvent)
+            .where(*conditions)
+            .order_by(MealEvent.meal_completed_at.asc(), MealEvent.source_sample_id.asc())
+            .limit(page_size + 1)
+        )
+        result = await self.session.execute(stmt)
+        rows = list(result.scalars().all())
+        truncated = len(rows) > page_size
+        page = rows[:page_size]
+
+        items = [
+            MealItem(
+                id=row.source_sample_id,
+                meal_completed_at=_ensure_aware(row.meal_completed_at),
+                foods=[str(item) for item in (row.foods or [])],
+                source=row.source,
+            )
+            for row in page
+        ]
+        next_cursor = None
+        if truncated and page:
+            last = page[-1]
+            next_cursor = _encode_meal_cursor(last.meal_completed_at, last.source_sample_id)
+
+        fresh = items[-1].meal_completed_at if items else None
+        return MealsResponse(
+            request_id=request_id,
+            start=start_utc,
+            end=end_utc,
+            timezone=tz_name,
+            record_count=len(items),
+            truncated=truncated,
+            next_cursor=next_cursor,
+            data_fresh_through=fresh,
+            items=items,
+        )
+
+    async def _coverage_for(
+        self,
+        timestamp_col: Any,
+        *conditions: Any,
+    ) -> CoverageCategory:
+        stmt = select(
+            func.count().label("count"),
+            func.min(timestamp_col).label("first_at"),
+            func.max(timestamp_col).label("last_at"),
+        ).where(*conditions)
+        row = (await self.session.execute(stmt)).one()
+        count = int(row.count or 0)
+        if count == 0:
+            return CoverageCategory(count=0, first_at=None, last_at=None)
+        return CoverageCategory(
+            count=count,
+            first_at=_ensure_aware(row.first_at) if row.first_at else None,
+            last_at=_ensure_aware(row.last_at) if row.last_at else None,
+        )
+
+    async def _glucose_raw(
+        self,
+        *,
+        request_id: str,
+        user_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+        timezone: str,
+    ) -> GlucoseSeriesResponse:
         stmt = (
             select(GlucoseSample)
             .where(
                 GlucoseSample.user_id == user_id,
                 GlucoseSample.deleted_at.is_(None),
-                GlucoseSample.sample_time >= query.start,
-                GlucoseSample.sample_time < query.end,
+                GlucoseSample.sample_time >= start,
+                GlucoseSample.sample_time < end,
             )
             .order_by(GlucoseSample.sample_time.asc())
         )
-        rows = await _fetch_with_cap(session, stmt, limit)
-        if not rows:
-            return _empty_response(query)
-        data = [
+        result = await self.session.execute(stmt)
+        rows = list(result.scalars().all())
+        points = [
             GlucoseRawPoint(
-                timestamp=row.sample_time,
-                value_mg_dl=_dec(row.value_mg_dl) or 0,
-                source_name=row.source_name,
-                source_sample_id=row.source_sample_id,
+                timestamp=_ensure_aware(row.sample_time),
+                value_mg_dl=_round_mg_dl(_dec(row.value_mg_dl), places=1) or 0.0,
             )
             for row in rows
         ]
-        return _response(query, data, rows[0].sample_time, rows[-1].sample_time)
-
-    bucket_seconds = RESOLUTION_SECONDS[query.resolution]
-    bucket_start = func.to_timestamp(
-        func.floor(func.extract("epoch", GlucoseSample.sample_time) / bucket_seconds)
-        * bucket_seconds
-    )
-    stmt = (
-        select(
-            bucket_start.label("bucket_start"),
-            func.count().label("count"),
-            func.min(GlucoseSample.value_mg_dl).label("min_mg_dl"),
-            func.max(GlucoseSample.value_mg_dl).label("max_mg_dl"),
-            func.avg(GlucoseSample.value_mg_dl).label("avg_mg_dl"),
+        fresh = points[-1].timestamp if points else None
+        return GlucoseSeriesResponse(
+            request_id=request_id,
+            start=start,
+            end=end,
+            timezone=timezone,
+            resolution="raw",
+            aggregation=None,
+            source_record_count=len(points),
+            returned_point_count=len(points),
+            truncated=False,
+            data_fresh_through=fresh,
+            points=points,
         )
-        .where(
+
+    async def _glucose_aggregated(
+        self,
+        *,
+        request_id: str,
+        user_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+        timezone: str,
+        resolution: str,
+    ) -> GlucoseSeriesResponse:
+        bucket_seconds = RESOLUTION_SECONDS[resolution]
+        # UTC-aligned epoch bucketing: floor(epoch / N) * N
+        bucket_start = func.to_timestamp(
+            func.floor(func.extract("epoch", GlucoseSample.sample_time) / bucket_seconds)
+            * bucket_seconds
+        )
+        source_count_stmt = select(func.count()).where(
             GlucoseSample.user_id == user_id,
             GlucoseSample.deleted_at.is_(None),
-            GlucoseSample.sample_time >= query.start,
-            GlucoseSample.sample_time < query.end,
+            GlucoseSample.sample_time >= start,
+            GlucoseSample.sample_time < end,
         )
-        .group_by("bucket_start")
-        .order_by("bucket_start")
-    )
-    result = await session.execute(stmt.limit(limit + 1))
-    rows = list(result.all())
-    if len(rows) > limit:
-        raise AppError(
-            code="TOO_MANY_ROWS",
-            message=f"Query matched more than {limit} aggregated buckets.",
-            hint="Narrow the time range or choose a coarser resolution.",
-            status_code=400,
-        )
-    if not rows:
-        return _empty_response(query)
+        source_record_count = int((await self.session.execute(source_count_stmt)).scalar_one())
 
-    data = []
-    for row in rows:
-        start = row.bucket_start
-        if start.tzinfo is None:
-            from datetime import UTC
-
-            start = start.replace(tzinfo=UTC)
-        end = start + timedelta(seconds=bucket_seconds)
-        data.append(
-            GlucoseBucketPoint(
-                bucket_start=start,
-                bucket_end=end,
-                count=int(row.count),
-                min_mg_dl=_dec(row.min_mg_dl) or 0,
-                max_mg_dl=_dec(row.max_mg_dl) or 0,
-                avg_mg_dl=round(float(row.avg_mg_dl), 2) if row.avg_mg_dl is not None else 0,
+        stmt = (
+            select(
+                bucket_start.label("bucket_start"),
+                func.count().label("sample_count"),
+                func.min(GlucoseSample.value_mg_dl).label("min_mg_dl"),
+                func.max(GlucoseSample.value_mg_dl).label("max_mg_dl"),
+                func.avg(GlucoseSample.value_mg_dl).label("mean_mg_dl"),
             )
+            .where(
+                GlucoseSample.user_id == user_id,
+                GlucoseSample.deleted_at.is_(None),
+                GlucoseSample.sample_time >= start,
+                GlucoseSample.sample_time < end,
+            )
+            .group_by("bucket_start")
+            .order_by("bucket_start")
         )
-    return _response(query, data, data[0].bucket_start, data[-1].bucket_start)
+        rows = list((await self.session.execute(stmt)).all())
+        points: list[GlucoseBucketPoint] = []
+        for row in rows:
+            bucket = _ensure_aware(row.bucket_start)
+            points.append(
+                GlucoseBucketPoint(
+                    start=bucket,
+                    end=bucket + timedelta(seconds=bucket_seconds),
+                    mean_mg_dl=_round_mg_dl(_dec(row.mean_mg_dl), places=1) or 0.0,
+                    min_mg_dl=_round_mg_dl(_dec(row.min_mg_dl), places=1) or 0.0,
+                    max_mg_dl=_round_mg_dl(_dec(row.max_mg_dl), places=1) or 0.0,
+                    sample_count=int(row.sample_count),
+                )
+            )
+        fresh = None
+        if points:
+            # Latest source sample time is more accurate than last bucket start.
+            last_stmt = select(func.max(GlucoseSample.sample_time)).where(
+                GlucoseSample.user_id == user_id,
+                GlucoseSample.deleted_at.is_(None),
+                GlucoseSample.sample_time >= start,
+                GlucoseSample.sample_time < end,
+            )
+            last_at = (await self.session.execute(last_stmt)).scalar_one_or_none()
+            fresh = _ensure_aware(last_at) if last_at else None
 
-
-async def query_runs(
-    session: AsyncSession,
-    user_id: uuid.UUID,
-    query: RunsSeriesQuery,
-) -> QueryResponse:
-    query.enforce_bounds()
-    limit = query.effective_limit()
-    stmt = (
-        select(Workout)
-        .where(
-            Workout.user_id == user_id,
-            Workout.deleted_at.is_(None),
-            Workout.start_time < query.end,
-            Workout.end_time > query.start,
+        return GlucoseSeriesResponse(
+            request_id=request_id,
+            start=start,
+            end=end,
+            timezone=timezone,
+            resolution=resolution,  # type: ignore[arg-type]
+            aggregation="mean_min_max",
+            source_record_count=source_record_count,
+            returned_point_count=len(points),
+            truncated=False,
+            data_fresh_through=fresh,
+            points=points,
         )
-        .order_by(Workout.start_time.asc())
-    )
-    rows = await _fetch_with_cap(session, stmt, limit)
-    if not rows:
-        return _empty_response(query)
-    data = [
-        RunPoint(
-            source_name=row.source_name,
-            source_sample_id=row.source_sample_id,
-            sport=row.sport,
-            start_time=row.start_time,
-            end_time=row.end_time,
-            duration_seconds=_duration_seconds(row.start_time, row.end_time),
-            distance_meters=_dec(row.distance_meters),
-            active_energy_kcal=_dec(row.active_energy_kcal),
-            average_heart_rate=_dec(row.average_heart_rate),
-            maximum_heart_rate=_dec(row.maximum_heart_rate),
+
+    async def _glucose_overall_summary(
+        self,
+        user_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+    ) -> GlucoseSummaryStats:
+        stmt = select(
+            func.count().label("sample_count"),
+            func.min(GlucoseSample.sample_time).label("first_at"),
+            func.max(GlucoseSample.sample_time).label("last_at"),
+            func.min(GlucoseSample.value_mg_dl).label("min_mg_dl"),
+            func.max(GlucoseSample.value_mg_dl).label("max_mg_dl"),
+            func.avg(GlucoseSample.value_mg_dl).label("mean_mg_dl"),
+            func.percentile_cont(0.5)
+            .within_group(GlucoseSample.value_mg_dl)
+            .label("median_mg_dl"),
+        ).where(
+            GlucoseSample.user_id == user_id,
+            GlucoseSample.deleted_at.is_(None),
+            GlucoseSample.sample_time >= start,
+            GlucoseSample.sample_time < end,
         )
-        for row in rows
-    ]
-    return _response(query, data, rows[0].start_time, rows[-1].start_time)
-
-
-async def query_sleep(
-    session: AsyncSession,
-    user_id: uuid.UUID,
-    query: SleepSeriesQuery,
-) -> QueryResponse:
-    query.enforce_bounds()
-    limit = query.effective_limit()
-    conditions = [
-        SleepInterval.user_id == user_id,
-        SleepInterval.deleted_at.is_(None),
-        SleepInterval.start_time < query.end,
-        SleepInterval.end_time > query.start,
-    ]
-    if query.stages:
-        conditions.append(SleepInterval.stage.in_([s.lower() for s in query.stages]))
-
-    stmt = select(SleepInterval).where(*conditions).order_by(SleepInterval.start_time.asc())
-    rows = await _fetch_with_cap(session, stmt, limit)
-    if not rows:
-        return _empty_response(query)
-    data = [
-        SleepPoint(
-            source_name=row.source_name,
-            source_sample_id=row.source_sample_id,
-            start_time=row.start_time,
-            end_time=row.end_time,
-            duration_seconds=_duration_seconds(row.start_time, row.end_time),
-            stage=row.stage,
+        row = (await self.session.execute(stmt)).one()
+        count = int(row.sample_count or 0)
+        if count == 0:
+            return GlucoseSummaryStats(
+                sample_count=0,
+                first_at=None,
+                last_at=None,
+                min_mg_dl=None,
+                max_mg_dl=None,
+                mean_mg_dl=None,
+                median_mg_dl=None,
+            )
+        return GlucoseSummaryStats(
+            sample_count=count,
+            first_at=_ensure_aware(row.first_at),
+            last_at=_ensure_aware(row.last_at),
+            min_mg_dl=_round_mg_dl(_dec(row.min_mg_dl), places=1),
+            max_mg_dl=_round_mg_dl(_dec(row.max_mg_dl), places=1),
+            mean_mg_dl=_round_mg_dl(_dec(row.mean_mg_dl), places=1),
+            median_mg_dl=_round_mg_dl(_dec(row.median_mg_dl), places=1),
         )
-        for row in rows
-    ]
-    return _response(query, data, rows[0].start_time, rows[-1].start_time)
 
+    async def _glucose_daily_summary(
+        self,
+        user_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+        timezone: str,
+    ) -> list[GlucoseDailySummary]:
+        # timestamptz → local wall clock via AT TIME ZONE, then truncate to local day.
+        # PostgreSQL applies the IANA zone's DST rules for the selected timezone.
+        local_day = func.date_trunc("day", func.timezone(timezone, GlucoseSample.sample_time))
 
-async def query_weight(
-    session: AsyncSession,
-    user_id: uuid.UUID,
-    query: WeightSeriesQuery,
-) -> QueryResponse:
-    query.enforce_bounds()
-    limit = query.effective_limit()
-    stmt = (
-        select(WeightMeasurement)
-        .where(
-            WeightMeasurement.user_id == user_id,
-            WeightMeasurement.deleted_at.is_(None),
-            WeightMeasurement.measured_at >= query.start,
-            WeightMeasurement.measured_at < query.end,
+        stmt = (
+            select(
+                local_day.label("local_day"),
+                func.count().label("sample_count"),
+                func.min(GlucoseSample.sample_time).label("first_at"),
+                func.max(GlucoseSample.sample_time).label("last_at"),
+                func.min(GlucoseSample.value_mg_dl).label("min_mg_dl"),
+                func.max(GlucoseSample.value_mg_dl).label("max_mg_dl"),
+                func.avg(GlucoseSample.value_mg_dl).label("mean_mg_dl"),
+                func.percentile_cont(0.5)
+                .within_group(GlucoseSample.value_mg_dl)
+                .label("median_mg_dl"),
+            )
+            .where(
+                GlucoseSample.user_id == user_id,
+                GlucoseSample.deleted_at.is_(None),
+                GlucoseSample.sample_time >= start,
+                GlucoseSample.sample_time < end,
+            )
+            .group_by("local_day")
+            .order_by("local_day")
         )
-        .order_by(WeightMeasurement.measured_at.asc())
-    )
-    rows = await _fetch_with_cap(session, stmt, limit)
-    if not rows:
-        return _empty_response(query)
-    data = [
-        WeightPoint(
-            timestamp=row.measured_at,
-            value_kg=_dec(row.value_kg) or 0,
-            source_name=row.source_name,
-            source_sample_id=row.source_sample_id,
-        )
-        for row in rows
-    ]
-    return _response(query, data, rows[0].measured_at, rows[-1].measured_at)
 
-
-async def query_meals(
-    session: AsyncSession,
-    user_id: uuid.UUID,
-    query: MealsQuery,
-) -> QueryResponse:
-    query.enforce_bounds()
-    limit = query.effective_limit()
-    stmt = (
-        select(MealEvent)
-        .where(
-            MealEvent.user_id == user_id,
-            MealEvent.deleted_at.is_(None),
-            MealEvent.meal_completed_at >= query.start,
-            MealEvent.meal_completed_at < query.end,
-        )
-        .order_by(MealEvent.meal_completed_at.asc())
-    )
-    rows = await _fetch_with_cap(session, stmt, limit)
-    if not rows:
-        return _empty_response(query)
-    data = [
-        MealPoint(
-            source=row.source,
-            source_sample_id=row.source_sample_id,
-            meal_completed_at=row.meal_completed_at,
-            foods=list(row.foods or []),
-            notes=row.notes,
-        )
-        for row in rows
-    ]
-    return _response(query, data, rows[0].meal_completed_at, rows[-1].meal_completed_at)
+        rows = list((await self.session.execute(stmt)).all())
+        days: list[GlucoseDailySummary] = []
+        for row in rows:
+            local_day_value = row.local_day
+            if isinstance(local_day_value, datetime):
+                local_date_value = local_day_value.date()
+            else:
+                local_date_value = local_day_value
+            days.append(
+                GlucoseDailySummary(
+                    local_date=local_date_value,
+                    sample_count=int(row.sample_count),
+                    first_at=_ensure_aware(row.first_at),
+                    last_at=_ensure_aware(row.last_at),
+                    min_mg_dl=_round_mg_dl(_dec(row.min_mg_dl), places=1) or 0.0,
+                    max_mg_dl=_round_mg_dl(_dec(row.max_mg_dl), places=1) or 0.0,
+                    mean_mg_dl=_round_mg_dl(_dec(row.mean_mg_dl), places=1) or 0.0,
+                    median_mg_dl=_round_mg_dl(_dec(row.median_mg_dl), places=1) or 0.0,
+                )
+            )
+        return days
