@@ -378,8 +378,8 @@ async def test_glucose_empty_and_invalid_resolution(
         ),
         headers=read_headers,
     )
-    assert bad.status_code == 400
-    assert bad.json()["error"]["code"] == "INVALID_REQUEST"
+    assert bad.status_code == 422
+    assert bad.json()["error"]["code"] == "INVALID_RESOLUTION"
 
 
 @pytest.mark.asyncio
@@ -680,8 +680,8 @@ async def test_meals_empty_default_limit_and_max(
         ),
         headers=read_headers,
     )
-    assert too_big.status_code == 400
-    assert too_big.json()["error"]["code"] == "INVALID_REQUEST"
+    assert too_big.status_code == 422
+    assert too_big.json()["error"]["code"] == "INVALID_LIMIT"
 
     bad_cursor = await client.get(
         "/v1/query/meals?"
@@ -694,6 +694,106 @@ async def test_meals_empty_default_limit_and_max(
     )
     assert bad_cursor.status_code == 422
     assert bad_cursor.json()["error"]["code"] == "INVALID_CURSOR"
+
+
+@pytest.mark.asyncio
+async def test_meal_cursor_rejects_range_mismatch(
+    client: AsyncClient,
+    ingest_headers: dict,
+    read_headers: dict,
+):
+    meals = [
+        {
+            "source": "manual",
+            "source_sample_id": f"meal-c-{i}",
+            "meal_completed_at": f"2026-08-0{5 + i}T12:00:00.000Z",
+            "foods": [f"food-{i}"],
+            "notes": "nope",
+        }
+        for i in range(3)
+    ]
+    body = {
+        "schema_version": 1,
+        "exported_at": "2026-08-10T12:00:00Z",
+        "data_start": "2026-08-01T00:00:00Z",
+        "data_end": "2026-08-10T12:00:00Z",
+        "glucose_samples": [],
+        "workouts": [],
+        "sleep_sessions": [],
+        "weight_measurements": [],
+        "meal_events": meals,
+    }
+    await _seed(client, ingest_headers, body)
+    page1 = await client.get(
+        "/v1/query/meals?"
+        + _q(start="2026-08-01T00:00:00Z", end="2026-08-12T00:00:00Z", limit="1"),
+        headers=read_headers,
+    )
+    assert page1.status_code == 200
+    cursor = page1.json()["next_cursor"]
+    mismatched = await client.get(
+        "/v1/query/meals?"
+        + _q(
+            start="2026-08-01T00:00:00Z",
+            end="2026-08-11T00:00:00Z",
+            limit="1",
+            cursor=cursor,
+        ),
+        headers=read_headers,
+    )
+    assert mismatched.status_code == 422
+    assert mismatched.json()["error"]["code"] == "INVALID_CURSOR"
+
+
+@pytest.mark.asyncio
+async def test_glucose_result_too_large(
+    client: AsyncClient,
+    ingest_headers: dict,
+    read_headers: dict,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr("app.services.query_service.MAX_GLUCOSE_POINTS", 2)
+    monkeypatch.setattr("app.schemas.queries.MAX_GLUCOSE_POINTS", 2)
+    samples = []
+    start = datetime(2026, 8, 1, tzinfo=UTC)
+    for i in range(4):
+        samples.append(
+            {
+                "source": "apple_health",
+                "source_sample_id": f"cap-{i}",
+                "source_name": "Stelo",
+                "sample_time": (start + timedelta(minutes=i * 5))
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "value": 90 + i,
+                "unit": "mg/dL",
+                "metadata": {},
+            }
+        )
+    body = {
+        "schema_version": 1,
+        "exported_at": "2026-08-01T12:00:00Z",
+        "data_start": "2026-08-01T00:00:00Z",
+        "data_end": "2026-08-01T12:00:00Z",
+        "glucose_samples": samples,
+        "workouts": [],
+        "sleep_sessions": [],
+        "weight_measurements": [],
+        "meal_events": [],
+    }
+    await _seed(client, ingest_headers, body)
+    resp = await client.get(
+        "/v1/query/glucose/series?"
+        + _q(
+            start="2026-08-01T00:00:00Z",
+            end="2026-08-02T00:00:00Z",
+            resolution="raw",
+        ),
+        headers=read_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "RESULT_TOO_LARGE"
+    assert resp.json()["error"]["details"]["max_points"] == 2
 
 
 # --- Read-only / security / regression ---

@@ -3,21 +3,26 @@
 All endpoints require Authorization: Bearer <READ_API_KEY>, explicit bounded
 time ranges, and return UTC source timestamps. Timezone is used only for
 local-calendar aggregation/labels (default America/New_York).
+
+Resource protection is application-level only: hard date-range limits, meal page
+size, glucose point ceilings, and Postgres statement_timeout on read queries.
+There is no in-process rate limiter; rely on those caps (and platform limits).
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request
 
 from app.api.dependencies import DbSession
-from app.core import DEFAULT_QUERY_TIMEZONE
+from app.core import DEFAULT_MEAL_LIMIT, DEFAULT_QUERY_TIMEZONE, MAX_MEAL_LIMIT
 from app.core.errors import AppError, ErrorResponse
-from app.core.security import RequireRead, require_read_auth
+from app.core.security import require_read_auth
 from app.schemas.responses import (
     CoverageResponse,
     GlucoseSeriesResponse,
@@ -52,7 +57,7 @@ _ERROR_RESPONSES = {
     },
     422: {
         "model": ErrorResponse,
-        "description": "Invalid time range, timezone, resolution, cursor, or limit",
+        "description": "Invalid time range, timezone, resolution, cursor, limit, or result size",
         "content": {
             "application/json": {
                 "examples": {
@@ -73,6 +78,20 @@ _ERROR_RESPONSES = {
                                 "code": "RANGE_TOO_LARGE",
                                 "message": "Raw glucose queries are limited to 7 days",
                                 "details": {"max_days": 7},
+                            },
+                            "request_id": "00000000-0000-0000-0000-000000000001",
+                        },
+                    },
+                    "result_too_large": {
+                        "summary": "Glucose point ceiling exceeded",
+                        "value": {
+                            "error": {
+                                "code": "RESULT_TOO_LARGE",
+                                "message": (
+                                    "Glucose query matched more than 10000 points; "
+                                    "narrow the time range or use a coarser resolution"
+                                ),
+                                "details": {"max_points": 10000},
                             },
                             "request_id": "00000000-0000-0000-0000-000000000001",
                         },
@@ -103,13 +122,18 @@ def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", "unknown"))
 
 
+def _qp(request: Request, name: str) -> str | None:
+    value = request.query_params.get(name)
+    return value if value else None
+
+
 def _log_query(
     *,
     request: Request,
     route: str,
     status: int,
-    start: datetime | None,
-    end: datetime | None,
+    start: str | datetime | None,
+    end: str | datetime | None,
     timezone: str | None,
     resolution: str | None = None,
     bucket: str | None = None,
@@ -118,6 +142,8 @@ def _log_query(
     latency_ms: float,
     error_code: str | None = None,
 ) -> None:
+    start_s = start.isoformat() if isinstance(start, datetime) else start
+    end_s = end.isoformat() if isinstance(end, datetime) else end
     logger.info(
         "query_access request_id=%s route=%s status=%s principal=%s "
         "start=%s end=%s timezone=%s resolution=%s bucket=%s "
@@ -126,8 +152,8 @@ def _log_query(
         route,
         status,
         getattr(request.state, "auth_role", "read"),
-        start.isoformat() if start else None,
-        end.isoformat() if end else None,
+        start_s,
+        end_s,
         timezone,
         resolution,
         bucket,
@@ -138,43 +164,28 @@ def _log_query(
     )
 
 
-async def _run_query(request: Request, route: str, coro):
+async def _execute[T](
+    request: Request,
+    route: str,
+    coro: Awaitable[T],
+    *,
+    on_success: Callable[
+        [T],
+        tuple[datetime, datetime, str, int | None, bool | None, str | None, str | None],
+    ],
+) -> T:
     started = time.perf_counter()
     try:
         result = await coro
         latency_ms = (time.perf_counter() - started) * 1000
-        record_count = None
-        truncated = None
-        resolution = getattr(result, "resolution", None)
-        bucket = getattr(result, "bucket", None)
-        if hasattr(result, "returned_point_count"):
-            record_count = result.returned_point_count
-        elif hasattr(result, "record_count"):
-            record_count = result.record_count
-        elif hasattr(result, "summary") and result.summary is not None:
-            record_count = result.summary.sample_count
-        elif hasattr(result, "days") and result.days is not None:
-            record_count = sum(day.sample_count for day in result.days)
-        elif hasattr(result, "coverage"):
-            record_count = sum(
-                cat.count
-                for cat in (
-                    result.coverage.glucose,
-                    result.coverage.meals,
-                    result.coverage.workouts,
-                    result.coverage.sleep_intervals,
-                    result.coverage.weight_measurements,
-                )
-            )
-        if hasattr(result, "truncated"):
-            truncated = result.truncated
+        start, end, timezone, record_count, truncated, resolution, bucket = on_success(result)
         _log_query(
             request=request,
             route=route,
             status=200,
-            start=getattr(result, "start", None),
-            end=getattr(result, "end", None),
-            timezone=getattr(result, "timezone", None),
+            start=start,
+            end=end,
+            timezone=timezone,
             resolution=resolution,
             bucket=bucket,
             record_count=record_count,
@@ -188,9 +199,11 @@ async def _run_query(request: Request, route: str, coro):
             request=request,
             route=route,
             status=exc.status_code,
-            start=None,
-            end=None,
-            timezone=None,
+            start=_qp(request, "start"),
+            end=_qp(request, "end"),
+            timezone=_qp(request, "timezone"),
+            resolution=_qp(request, "resolution"),
+            bucket=_qp(request, "bucket"),
             latency_ms=latency_ms,
             error_code=exc.code,
         )
@@ -228,7 +241,6 @@ async def _run_query(request: Request, route: str, coro):
 async def get_coverage(
     request: Request,
     db: DbSession,
-    _auth: RequireRead,
     start: Annotated[
         datetime,
         Query(description="Inclusive range start (ISO-8601 with timezone)"),
@@ -243,7 +255,7 @@ async def get_coverage(
     ] = DEFAULT_QUERY_TIMEZONE,
 ) -> CoverageResponse:
     service = HealthDataQueryService(db)
-    return await _run_query(
+    return await _execute(
         request,
         "/v1/query/coverage",
         service.coverage(
@@ -252,6 +264,7 @@ async def get_coverage(
             end=end,
             timezone=timezone,
         ),
+        on_success=lambda r: (r.start, r.end, r.timezone, None, None, None, None),
     )
 
 
@@ -268,9 +281,10 @@ async def get_coverage(
         "- `5m` — max 31 days; UTC-aligned buckets with mean/min/max/sample_count\n"
         "- `15m` — max 90 days (default)\n"
         "- `hourly` — max 365 days\n\n"
-        "Empty buckets are omitted (no interpolation). Aggregation for non-raw "
-        "responses is `mean_min_max`. Internal IDs, source sample IDs, and metadata "
-        "are never returned."
+        "Hard ceiling: at most 10000 returned points (raw or buckets); excess raises "
+        "`RESULT_TOO_LARGE`. Empty buckets are omitted (no interpolation). "
+        "Aggregation for non-raw responses is `mean_min_max`. Internal IDs, source "
+        "sample IDs, and metadata are never returned."
     ),
     responses={
         **_ERROR_RESPONSES,
@@ -308,7 +322,6 @@ async def get_coverage(
 async def get_glucose_series(
     request: Request,
     db: DbSession,
-    _auth: RequireRead,
     start: Annotated[
         datetime, Query(description="Inclusive range start (ISO-8601 with timezone)")
     ],
@@ -316,8 +329,8 @@ async def get_glucose_series(
         datetime, Query(description="Exclusive range end (ISO-8601 with timezone)")
     ],
     resolution: Annotated[
-        Literal["raw", "5m", "15m", "hourly"],
-        Query(description="Series resolution (default 15m)"),
+        str,
+        Query(description="Series resolution: raw, 5m, 15m, or hourly (default 15m)"),
     ] = "15m",
     timezone: Annotated[
         str,
@@ -325,7 +338,7 @@ async def get_glucose_series(
     ] = DEFAULT_QUERY_TIMEZONE,
 ) -> GlucoseSeriesResponse:
     service = HealthDataQueryService(db)
-    return await _run_query(
+    return await _execute(
         request,
         "/v1/query/glucose/series",
         service.glucose_series(
@@ -334,6 +347,15 @@ async def get_glucose_series(
             end=end,
             resolution=resolution,
             timezone=timezone,
+        ),
+        on_success=lambda r: (
+            r.start,
+            r.end,
+            r.timezone,
+            r.returned_point_count,
+            r.truncated,
+            r.resolution,
+            None,
         ),
     )
 
@@ -356,7 +378,6 @@ async def get_glucose_series(
 async def get_glucose_summary(
     request: Request,
     db: DbSession,
-    _auth: RequireRead,
     start: Annotated[
         datetime, Query(description="Inclusive range start (ISO-8601 with timezone)")
     ],
@@ -368,12 +389,22 @@ async def get_glucose_summary(
         Query(description=f"IANA timezone for daily grouping (default {DEFAULT_QUERY_TIMEZONE})"),
     ] = DEFAULT_QUERY_TIMEZONE,
     bucket: Annotated[
-        Literal["overall", "daily"],
-        Query(description="Summary bucketing mode (default overall)"),
+        str,
+        Query(description="Summary bucketing mode: overall or daily (default overall)"),
     ] = "overall",
 ) -> GlucoseSummaryResponse:
     service = HealthDataQueryService(db)
-    return await _run_query(
+
+    def _success(r: GlucoseSummaryResponse):
+        if r.summary is not None:
+            count = r.summary.sample_count
+        elif r.days is not None:
+            count = sum(day.sample_count for day in r.days)
+        else:
+            count = 0
+        return r.start, r.end, r.timezone, count, None, None, r.bucket
+
+    return await _execute(
         request,
         "/v1/query/glucose/summary",
         service.glucose_summary(
@@ -383,6 +414,7 @@ async def get_glucose_summary(
             timezone=timezone,
             bucket=bucket,
         ),
+        on_success=_success,
     )
 
 
@@ -397,8 +429,9 @@ async def get_glucose_summary(
         "Authenticated callers receive food strings. Notes, metadata, database "
         "primary keys, and internal source catalog IDs are never returned. "
         "Public `id` is the stable `source_sample_id`.\n\n"
-        "Pagination: default `limit=100`, maximum `limit=500`. When truncated, "
-        "`truncated=true` and `next_cursor` are set."
+        f"Pagination: default `limit={DEFAULT_MEAL_LIMIT}`, maximum "
+        f"`limit={MAX_MEAL_LIMIT}`. When truncated, `truncated=true` and a "
+        "HMAC-signed `next_cursor` (bound to the request range) are set."
     ),
     responses={
         **_ERROR_RESPONSES,
@@ -432,7 +465,6 @@ async def get_glucose_summary(
 async def get_meals(
     request: Request,
     db: DbSession,
-    _auth: RequireRead,
     start: Annotated[
         datetime, Query(description="Inclusive range start (ISO-8601 with timezone)")
     ],
@@ -445,15 +477,15 @@ async def get_meals(
     ] = DEFAULT_QUERY_TIMEZONE,
     limit: Annotated[
         int | None,
-        Query(description="Page size (default 100, max 500)", ge=1, le=500),
+        Query(description=f"Page size (default {DEFAULT_MEAL_LIMIT}, max {MAX_MEAL_LIMIT})"),
     ] = None,
     cursor: Annotated[
         str | None,
-        Query(description="Opaque pagination cursor from a prior next_cursor"),
+        Query(description="HMAC-signed pagination cursor from a prior next_cursor"),
     ] = None,
 ) -> MealsResponse:
     service = HealthDataQueryService(db)
-    return await _run_query(
+    return await _execute(
         request,
         "/v1/query/meals",
         service.meals(
@@ -463,5 +495,14 @@ async def get_meals(
             timezone=timezone,
             limit=limit,
             cursor=cursor,
+        ),
+        on_success=lambda r: (
+            r.start,
+            r.end,
+            r.timezone,
+            r.record_count,
+            r.truncated,
+            None,
+            None,
         ),
     )

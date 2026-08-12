@@ -26,11 +26,11 @@ class Settings(BaseSettings):
     cors_origins: str = Field(default="*", alias="CORS_ORIGINS")
     db_echo: bool = Field(default=False, alias="DB_ECHO")
 
-    # Query bounds
-    default_lookback_days: int = 30
-    max_lookback_days: int = 365
-    default_row_cap: int = 5000
-    hard_row_cap: int = 20_000
+    # Query read path: Postgres statement_timeout (milliseconds).
+    query_statement_timeout_ms: int = Field(default=10_000, alias="QUERY_STATEMENT_TIMEOUT_MS")
+
+    # Interactive OpenAPI docs. None → enabled outside production.
+    enable_api_docs: bool | None = Field(default=None, alias="ENABLE_API_DOCS")
 
     # Phase 1 single principal
     primary_user_external_id: str = "personal-primary"
@@ -60,12 +60,31 @@ class Settings(BaseSettings):
                 return False
         return value
 
+    @field_validator("enable_api_docs", mode="before")
+    @classmethod
+    def coerce_enable_api_docs(cls, value: object) -> object:
+        if value is None or value == "":
+            return None
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+        return value
+
     @property
     def cors_origin_list(self) -> list[str]:
         raw = self.cors_origins.strip()
         if raw == "*":
             return ["*"]
         return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+    @property
+    def api_docs_enabled(self) -> bool:
+        if self.enable_api_docs is not None:
+            return self.enable_api_docs
+        return self.environment.lower() not in {"production", "prod"}
 
     @property
     def sync_database_url(self) -> str:

@@ -22,6 +22,9 @@ RESOLUTION_MAX_DAYS: dict[str, int] = {
     "hourly": 365,
 }
 
+# Hard maximum returned points (raw samples or aggregate buckets).
+MAX_GLUCOSE_POINTS = 10_000
+
 DEFAULT_QUERY_TIMEZONE = "America/New_York"
 DEFAULT_MEAL_LIMIT = 100
 MAX_MEAL_LIMIT = 500

@@ -41,6 +41,8 @@ iPhone app
 | `ENVIRONMENT` | no | `development` / `test` / `production` |
 | `LOG_LEVEL` | no | Default `INFO` |
 | `CORS_ORIGINS` | no | `*` or comma-separated origins |
+| `QUERY_STATEMENT_TIMEOUT_MS` | no | Postgres `statement_timeout` for Query API reads (default `10000`) |
+| `ENABLE_API_DOCS` | no | Interactive `/docs` + `/openapi.json`. Default: on outside production, off in production |
 
 Copy `.env.example` to `.env` and edit values. Never commit secrets. Do not log `DATABASE_URL`.
 
@@ -94,7 +96,9 @@ alembic downgrade -1
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Docs: http://localhost:8000/docs
+Docs (when enabled): http://localhost:8000/docs
+
+In `ENVIRONMENT=production`, interactive docs and `/openapi.json` are disabled unless `ENABLE_API_DOCS=true`.
 
 Or full stack:
 
@@ -126,7 +130,11 @@ All query endpoints are **read-only** and require explicit bounded time ranges (
 | GET | `/v1/query/glucose/summary` | Overall or daily descriptive stats |
 | GET | `/v1/query/meals` | Meals with foods (notes excluded); cursor pagination |
 
-Glucose resolution hard limits: raw 7d, 5m 31d, 15m 90d, hourly 365d (oversized ranges rejected). Meals default `limit=100`, max `500`.
+Glucose resolution hard limits: raw 7d, 5m 31d, 15m 90d, hourly 365d (oversized ranges rejected). Hard ceiling of **10000** returned glucose points (raw or buckets) → `RESULT_TOO_LARGE`. Meals default `limit=100`, max `500` with HMAC-signed cursors bound to the request range.
+
+**Resource protection:** there is **no in-process rate limiter**. Protection is range limits, meal page size, glucose point ceiling, and `QUERY_STATEMENT_TIMEOUT_MS` (default 10s) on Query API Postgres statements, plus whatever the host platform provides.
+
+**Breaking change (0.2.0):** POST `/v1/query/series/*` and `/v1/query/events/meals` were removed. Use GET `/v1/query/*` only.
 
 ## Idempotency
 

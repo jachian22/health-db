@@ -1,6 +1,6 @@
 [project]
 name = "health-db"
-version = "0.1.0"
+version = "0.2.0"
 description = "Personal health data platform — Phase 1 API"
 requires-python = ">=3.12"
 dependencies = [

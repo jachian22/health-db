@@ -46,3 +46,31 @@ def test_database_url_defaults_to_none():
         _env_file=None,
     )
     assert settings.database_url is None
+
+
+def test_api_docs_default_off_in_production():
+    prod = Settings(
+        ENVIRONMENT="production",
+        INGEST_API_KEY="key-a",
+        READ_API_KEY="key-b",
+        _env_file=None,
+    )
+    assert prod.api_docs_enabled is False
+
+    forced = Settings(
+        ENVIRONMENT="production",
+        ENABLE_API_DOCS="true",
+        INGEST_API_KEY="key-a",
+        READ_API_KEY="key-b",
+        _env_file=None,
+    )
+    assert forced.api_docs_enabled is True
+
+
+def test_query_statement_timeout_default():
+    settings = Settings(
+        INGEST_API_KEY="key-a",
+        READ_API_KEY="key-b",
+        _env_file=None,
+    )
+    assert settings.query_statement_timeout_ms == 10_000

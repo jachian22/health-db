@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from httpx import AsyncClient
+from httpx import ASGITransport, AsyncClient
 
 
 @pytest.mark.asyncio
@@ -42,10 +42,12 @@ async def test_openapi_documents_query_api_v1(client: AsyncClient):
 
     glucose = paths["/v1/query/glucose/series"]["get"]
     assert "7 days" in glucose["description"]
+    assert "10000" in glucose["description"]
     assert "mg/dL" in glucose["description"] or "mg/dl" in glucose["description"].lower()
 
     meals = paths["/v1/query/meals"]["get"]
     assert "notes" in meals["description"].lower()
+    assert "hmac" in meals["description"].lower()
 
     # Error schema exists
     schemas = spec["components"]["schemas"]
@@ -55,3 +57,23 @@ async def test_openapi_documents_query_api_v1(client: AsyncClient):
     assert "read-only" in desc
     assert "america/new_york" in desc
     assert "[start, end)" in spec["info"]["description"] or "half-open" in desc
+    assert "0.2.0" in spec["info"]["version"] or "breaking" in desc
+
+
+@pytest.mark.asyncio
+async def test_docs_disabled_in_production(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.delenv("ENABLE_API_DOCS", raising=False)
+    from app.core.config import get_settings
+    from app.main import create_app
+
+    get_settings.cache_clear()
+    app = create_app()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        assert (await ac.get("/openapi.json")).status_code == 404
+        assert (await ac.get("/docs")).status_code == 404
+        root = await ac.get("/")
+        assert root.status_code == 200
+        assert "docs" not in root.json()
+    get_settings.cache_clear()

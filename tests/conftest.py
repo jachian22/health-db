@@ -13,10 +13,12 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-# Ensure test keys / env before app imports settings
-os.environ.setdefault("ENVIRONMENT", "test")
-os.environ.setdefault("INGEST_API_KEY", "test-ingest-key")
-os.environ.setdefault("READ_API_KEY", "test-read-key")
+# Ensure test keys / env before app imports settings.
+# Force-assign so a developer shell export (e.g. local curl READ_API_KEY) cannot
+# leak into the test suite via setdefault.
+os.environ["ENVIRONMENT"] = "test"
+os.environ["INGEST_API_KEY"] = "test-ingest-key"
+os.environ["READ_API_KEY"] = "test-read-key"
 os.environ.setdefault("LOG_LEVEL", "WARNING")
 
 TEST_DATABASE_URL = os.environ.get(

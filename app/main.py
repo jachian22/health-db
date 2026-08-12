@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app import __version__
+from app.core.config import get_settings
 
 logger = logging.getLogger("app.main")
 
@@ -26,6 +27,11 @@ async def lifespan(_app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    settings = get_settings()
+    docs_url = "/docs" if settings.api_docs_enabled else None
+    redoc_url = "/redoc" if settings.api_docs_enabled else None
+    openapi_url = "/openapi.json" if settings.api_docs_enabled else None
+
     application = FastAPI(
         title="Health Data Platform",
         description=(
@@ -40,9 +46,14 @@ def create_app() -> FastAPI:
             "- Glucose units: mg/dL. Weight units: kg.\n"
             "- Query API uses `READ_API_KEY`; ingest uses `INGEST_API_KEY` "
             "(keys are not interchangeable).\n"
+            "- Breaking change in 0.2.0: POST `/v1/query/series/*` and "
+            "`/v1/query/events/meals` were removed in favor of GET `/v1/query/*`.\n"
         ),
         version=__version__,
         lifespan=lifespan,
+        docs_url=docs_url,
+        redoc_url=redoc_url,
+        openapi_url=openapi_url,
     )
 
     # Operational probes first so Railway healthchecks and readiness can work
@@ -54,12 +65,14 @@ def create_app() -> FastAPI:
 
     @application.get("/", include_in_schema=False)
     async def root() -> dict:
-        return {
+        payload: dict = {
             "service": "health-db",
             "version": __version__,
-            "docs": "/docs",
             "phase": 1,
         }
+        if settings.api_docs_enabled:
+            payload["docs"] = "/docs"
+        return payload
 
     try:
         _mount_phase1(application)
@@ -116,7 +129,8 @@ def _mount_phase1(application: FastAPI) -> None:
         application.openapi_schema = schema
         return application.openapi_schema
 
-    application.openapi = custom_openapi
+    if settings.api_docs_enabled:
+        application.openapi = custom_openapi
 
     origins = settings.cors_origin_list
     application.add_middleware(
@@ -148,7 +162,7 @@ def _mount_phase1(application: FastAPI) -> None:
 
     application.include_router(ingest.router)
     application.include_router(query.router)
-    logger.info("phase1_wiring_complete")
+    logger.info("app_wiring_complete")
 
 
 app = create_app()

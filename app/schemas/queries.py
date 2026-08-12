@@ -9,6 +9,7 @@ from app.core import (
     ALLOWED_GLUCOSE_RESOLUTIONS,
     DEFAULT_MEAL_LIMIT,
     DEFAULT_QUERY_TIMEZONE,
+    MAX_GLUCOSE_POINTS,
     MAX_MEAL_LIMIT,
     RESOLUTION_MAX_DAYS,
 )
@@ -79,6 +80,19 @@ def enforce_glucose_range_limit(start: datetime, end: datetime, resolution: str)
             message=f"{label} glucose queries are limited to {max_days} days",
             status_code=422,
             details={"max_days": max_days},
+        )
+
+
+def enforce_glucose_point_limit(count: int) -> None:
+    if count > MAX_GLUCOSE_POINTS:
+        raise AppError(
+            code="RESULT_TOO_LARGE",
+            message=(
+                f"Glucose query matched more than {MAX_GLUCOSE_POINTS} points; "
+                "narrow the time range or use a coarser resolution"
+            ),
+            status_code=422,
+            details={"max_points": MAX_GLUCOSE_POINTS},
         )
 
 
