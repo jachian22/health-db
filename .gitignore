@@ -21,3 +21,4 @@ htmlcov/
 *.sqlite3
 .idea/
 .vscode/
+.cursor/mcp.json

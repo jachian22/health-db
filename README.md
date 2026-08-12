@@ -1,6 +1,6 @@
 # Health Data Platform — Phase 1
 
-Personal FastAPI + PostgreSQL service that ingests an iOS HealthKit export, stores normalized health data idempotently, and exposes Query API v1 (authenticated, read-only) for later MCP/agent access.
+Personal FastAPI + PostgreSQL service that ingests an iOS HealthKit export, stores normalized health data idempotently, exposes Query API v1 (authenticated, read-only), and a separate stateless Streamable HTTP MCP service for Cursor.
 
 ## What Phase 1 does
 
@@ -14,8 +14,7 @@ Personal FastAPI + PostgreSQL service that ingests an iOS HealthKit export, stor
 ## What Phase 1 does **not** do
 
 - Direct HealthKit access, iOS upload, OAuth, or multi-user product flows
-- MCP server, agent orchestration, charts/UI
-- Workout / sleep / weight Query API routes (coverage reports existence only)
+- Agent orchestration, charts/UI, workout/sleep/weight Query API routes (coverage reports existence only)
 - Arbitrary SQL or natural-language → SQL
 - Sleep sessionization, fasting windows, meal-response derivation
 - Meal notes in Query API responses
@@ -27,9 +26,11 @@ iPhone app
 → POST /v1/ingest/batch
 → Railway Postgres
 → GET /v1/query/*
-→ future MCP server
-→ agent / visualization client
+→ stateless Streamable HTTP MCP service (/mcp)
+→ Cursor agent
 ```
+
+The MCP service is a separate Railway service in this repository (`mcp/`). It does not connect to Postgres. See [docs/mcp.md](docs/mcp.md).
 
 ## Environment variables
 
@@ -233,6 +234,14 @@ curl -sS \
 **Logged (application logs, metadata only):** request ID, path, method, status, error type. Persistent per-request audit rows (`request_audit_logs`) are deferred to a later phase; the Phase 1 schema intentionally omits that table.
 
 **Not logged:** Authorization headers, raw export payloads (except the intentional one-copy `ingestion_batches.raw_payload`), glucose arrays, meal foods/text, full response bodies, database credentials.
+
+## MCP service
+
+Standalone app in `mcp/`. Cursor authenticates with `MCP_API_KEY` only; the MCP service calls Query API with `READ_API_KEY`. Cursor never receives `READ_API_KEY` or `INGEST_API_KEY`.
+
+```bash
+cd mcp && pip install -e ".[dev]" && pytest
+```
 
 ## Tests
 
