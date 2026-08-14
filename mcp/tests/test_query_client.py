@@ -11,9 +11,11 @@ from mcp import Client
 
 from mcp_service.errors import QueryAPIError
 from mcp_service.query_api_client import (
+    CONTEXT_SNAPSHOT_PATH,
     COVERAGE_PATH,
     GLUCOSE_SERIES_PATH,
     GLUCOSE_SUMMARY_PATH,
+    LAST_LOGGED_MEAL_PATH,
     MEALS_PATH,
     READY_PATH,
     SLEEP_INTERVALS_PATH,
@@ -23,10 +25,13 @@ from mcp_service.query_api_client import (
 )
 from mcp_service.tools import build_mcp_server
 from tests.conftest import (
+    ANCHOR,
     TEST_READ_KEY,
     FakeQueryClient,
     assert_no_secrets,
+    default_context_snapshot,
     default_coverage,
+    default_last_logged_meal,
     make_settings,
     query_error,
 )
@@ -331,3 +336,84 @@ async def test_check_ready_does_not_send_read_key():
     assert ok is True
     assert seen[0].url.path == READY_PATH
     assert "authorization" not in seen[0].headers
+
+
+@pytest.mark.asyncio
+async def test_last_logged_meal_and_snapshot_routes():
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.headers["authorization"] == f"Bearer {TEST_READ_KEY}"
+        if request.url.path == LAST_LOGGED_MEAL_PATH:
+            assert request.url.params["anchor"].endswith("Z") or "2026-08-15" in request.url.params["anchor"]
+            assert request.url.params["lookback_days"] == "14"
+            return httpx.Response(200, json=default_last_logged_meal().model_dump(mode="json"))
+        if request.url.path == CONTEXT_SNAPSHOT_PATH:
+            assert request.url.params["meal_lookback_days"] == "10"
+            assert request.url.params["sleep_lookback_hours"] == "12"
+            assert request.url.params["glucose_lookback_hours"] == "6"
+            return httpx.Response(200, json=default_context_snapshot().model_dump(mode="json"))
+        return httpx.Response(404, json={"error": {"code": "NO", "message": "no"}})
+
+    client = _client_for(handler)
+    meal = await client.get_last_logged_meal(
+        anchor=ANCHOR, timezone="America/New_York", lookback_days=14
+    )
+    snapshot = await client.get_context_snapshot(
+        anchor=ANCHOR,
+        timezone="America/New_York",
+        meal_lookback_days=10,
+        sleep_lookback_hours=12,
+        glucose_lookback_hours=6,
+    )
+    await client.aclose()
+    assert meal.meal is not None
+    assert "points" not in snapshot.model_dump()
+    assert [request.url.path for request in seen] == [
+        LAST_LOGGED_MEAL_PATH,
+        CONTEXT_SNAPSHOT_PATH,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_last_logged_meal_maps_422_and_401():
+    def handler_422(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            json={
+                "error": {
+                    "code": "INVALID_LOOKBACK",
+                    "message": "lookback_days must be a positive integer",
+                }
+            },
+        )
+
+    client = _client_for(handler_422)
+    with pytest.raises(QueryAPIError) as raised:
+        await client.get_last_logged_meal(
+            anchor=ANCHOR, timezone="America/New_York", lookback_days=1
+        )
+    await client.aclose()
+    assert raised.value.code == "INVALID_LOOKBACK"
+    assert TEST_READ_KEY not in raised.value.message
+
+    def handler_401(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={"error": {"code": "LEAK", "message": "raw body with secret test-read-key"}},
+        )
+
+    client = _client_for(handler_401)
+    with pytest.raises(QueryAPIError) as raised_401:
+        await client.get_context_snapshot(
+            anchor=ANCHOR,
+            timezone="America/New_York",
+            meal_lookback_days=30,
+            sleep_lookback_hours=24,
+            glucose_lookback_hours=24,
+        )
+    await client.aclose()
+    assert raised_401.value.code == "UPSTREAM_UNAVAILABLE"
+    assert TEST_READ_KEY not in raised_401.value.message
+    assert "raw body" not in raised_401.value.message

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
+
+from app.api.v1.query import logger as query_logger
+from app.services.query_service import _duration_minutes
 
 
 async def _seed(client: AsyncClient, ingest_headers: dict, seed_body: dict) -> None:
@@ -958,9 +962,16 @@ async def test_query_endpoints_get_only(client: AsyncClient, read_headers: dict)
         "/v1/query/workouts",
         "/v1/query/sleep-intervals",
         "/v1/query/weight-measurements",
+        "/v1/query/last-logged-meal",
+        "/v1/query/context-snapshot",
     ):
+        suffix = (
+            _q(anchor="2026-08-15T14:00:00Z")
+            if path in {"/v1/query/last-logged-meal", "/v1/query/context-snapshot"}
+            else _q(start="2026-08-01T00:00:00Z", end="2026-08-02T00:00:00Z")
+        )
         resp = await client.post(
-            path + "?" + _q(start="2026-08-01T00:00:00Z", end="2026-08-02T00:00:00Z"),
+            path + "?" + suffix,
             headers=read_headers,
         )
         assert resp.status_code == 405
@@ -1091,6 +1102,36 @@ def _weight(sample_id: str, measured_at: str, value: float) -> dict:
         "value": value,
         "unit": "kg",
         "metadata": {"source_app": "Health"},
+    }
+
+
+def _meal(
+    sample_id: str,
+    completed_at: str,
+    *,
+    foods: list[str] | None = None,
+    notes: str | None = "secret-note-do-not-leak",
+) -> dict:
+    return {
+        "source": "manual",
+        "source_sample_id": sample_id,
+        "source_name": "Health",
+        "meal_completed_at": completed_at,
+        "foods": foods if foods is not None else ["rice"],
+        "notes": notes,
+        "metadata": {"secret": "do-not-leak"},
+    }
+
+
+def _glucose(sample_id: str, sample_time: str, value: float) -> dict:
+    return {
+        "source": "apple_health",
+        "source_sample_id": sample_id,
+        "source_name": "Stelo",
+        "sample_time": sample_time,
+        "value": value,
+        "unit": "mg/dL",
+        "metadata": {},
     }
 
 
@@ -1600,3 +1641,648 @@ async def test_list_pagination_stable_order_and_cursor_isolation(
     )
     assert sl2.json()["items"][0]["id"] == "sl-page-1"
     assert wt2.json()["items"][0]["id"] == "wt-page-1"
+
+
+# --- M2: last logged meal / context snapshot ---
+
+
+M2_ANCHOR = "2026-08-15T14:00:00Z"
+M2_ANCHOR_DT = datetime(2026, 8, 15, 14, 0, tzinfo=UTC)
+M2_FOOD = "SECRET_M2_FOOD_xyz"
+LAST_MEAL_PATH = "/v1/query/last-logged-meal"
+SNAPSHOT_PATH = "/v1/query/context-snapshot"
+M2_SENSITIVE_KEYS = (
+    "notes",
+    "metadata",
+    "user_id",
+    "source_name",
+    "ingested_at",
+    "updated_at",
+    "deleted_at",
+    "health_source_id",
+    "average_heart_rate",
+    "maximum_heart_rate",
+    "active_energy_kcal",
+    "stage",
+    "points",
+)
+
+
+def _last_meal_url(**params: str) -> str:
+    query = {"anchor": M2_ANCHOR, **params}
+    return LAST_MEAL_PATH + "?" + _q(**query)
+
+
+def _snapshot_url(**params: str) -> str:
+    query = {"anchor": M2_ANCHOR, **params}
+    return SNAPSHOT_PATH + "?" + _q(**query)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path_fn", [_last_meal_url, _snapshot_url])
+async def test_m2_missing_auth_returns_401(client: AsyncClient, path_fn):
+    resp = await client.get(path_fn())
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "UNAUTHORIZED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path_fn", [_last_meal_url, _snapshot_url])
+async def test_m2_wrong_key_returns_401(client: AsyncClient, path_fn):
+    resp = await client.get(path_fn(), headers={"Authorization": "Bearer wrong-key"})
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "UNAUTHORIZED"
+    assert "wrong-key" not in resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path_fn", [_last_meal_url, _snapshot_url])
+async def test_m2_ingest_key_returns_401(
+    client: AsyncClient, ingest_headers: dict, path_fn
+):
+    resp = await client.get(path_fn(), headers=ingest_headers)
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "UNAUTHORIZED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path_fn", [_last_meal_url, _snapshot_url])
+async def test_m2_naive_anchor_rejected(client: AsyncClient, read_headers: dict, path_fn):
+    resp = await client.get(
+        path_fn().replace(M2_ANCHOR, "2026-08-15T14:00:00"),
+        headers=read_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "INVALID_TIME_RANGE"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path_fn", [_last_meal_url, _snapshot_url])
+async def test_m2_invalid_timezone_rejected(
+    client: AsyncClient, read_headers: dict, path_fn
+):
+    resp = await client.get(path_fn(timezone="Not/A_Zone"), headers=read_headers)
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "INVALID_TIMEZONE"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path_fn", "param"),
+    [
+        (_last_meal_url, "lookback_days"),
+        (_snapshot_url, "meal_lookback_days"),
+        (_snapshot_url, "sleep_lookback_hours"),
+        (_snapshot_url, "glucose_lookback_hours"),
+    ],
+)
+@pytest.mark.parametrize("bad", ["0", "-1", "abc", "1.5", "true"])
+async def test_m2_invalid_lookback_rejected(
+    client: AsyncClient, read_headers: dict, path_fn, param: str, bad: str
+):
+    resp = await client.get(path_fn(**{param: bad}), headers=read_headers)
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "INVALID_LOOKBACK"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path_fn", "param", "too_big"),
+    [
+        (_last_meal_url, "lookback_days", "31"),
+        (_snapshot_url, "meal_lookback_days", "31"),
+        (_snapshot_url, "sleep_lookback_hours", "37"),
+        (_snapshot_url, "glucose_lookback_hours", "49"),
+    ],
+)
+async def test_m2_lookback_above_max_rejected(
+    client: AsyncClient, read_headers: dict, path_fn, param: str, too_big: str
+):
+    resp = await client.get(path_fn(**{param: too_big}), headers=read_headers)
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "RANGE_TOO_LARGE"
+
+
+@pytest.mark.asyncio
+async def test_last_logged_meal_boundaries_latest_and_ties(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            meal_events=[
+                _meal("meal-at-anchor", "2026-08-15T14:00:00.000Z", foods=[M2_FOOD]),
+                _meal("meal-after-anchor", "2026-08-15T14:00:01.000Z", foods=["after"]),
+                _meal("meal-at-lookback", "2026-07-16T14:00:00.000Z", foods=["bound"]),
+                _meal("meal-before-lookback", "2026-07-16T13:59:59.000Z", foods=["stale"]),
+                _meal("meal-older", "2026-08-13T12:00:00.000Z", foods=["older"]),
+            ]
+        ),
+    )
+    included = await client.get(_last_meal_url(), headers=read_headers)
+    assert included.status_code == 200
+    body = included.json()
+    assert body["meal"]["id"] == "meal-at-anchor"
+    assert body["meal"]["foods"] == [M2_FOOD]
+    assert body["lookback_days"] == 30
+    assert body["timezone"] == "America/New_York"
+    assert "next_cursor" not in body
+    assert "truncated" not in body
+    for key in M2_SENSITIVE_KEYS:
+        assert key not in body["meal"]
+        assert key not in body
+    assert "secret-note" not in included.text
+    meal_at = datetime.fromisoformat(body["meal"]["meal_completed_at"].replace("Z", "+00:00"))
+    assert body["derived"]["minutes_since_last_logged_meal"] == _duration_minutes(
+        meal_at, M2_ANCHOR_DT
+    )
+    assert (
+        body["derived"]["basis"]
+        == "anchor minus meal_completed_at of the latest logged meal"
+    )
+    limits = " ".join(body["limits"]).lower()
+    assert "logged meal" in limits
+    assert "fasting" in limits
+    assert "medical advice" in limits
+
+    only_bound = await client.get(
+        _last_meal_url(lookback_days="30"),
+        headers=read_headers,
+    )
+    assert only_bound.json()["meal"]["id"] == "meal-at-anchor"
+
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            meal_events=[
+                _meal("meal-a", "2026-08-14T12:00:00.000Z", foods=["a"]),
+                _meal("meal-z", "2026-08-14T12:00:00.000Z", foods=["z"]),
+            ]
+        ),
+    )
+    tied = await client.get(
+        _last_meal_url(anchor="2026-08-14T12:00:00Z"),
+        headers=read_headers,
+    )
+    assert tied.status_code == 200
+    assert tied.json()["meal"]["id"] == "meal-z"
+
+
+@pytest.mark.asyncio
+async def test_last_logged_meal_lookback_bound_included(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            meal_events=[
+                _meal("meal-at-lookback", "2026-07-16T14:00:00.000Z", foods=["bound"]),
+            ]
+        ),
+    )
+    resp = await client.get(_last_meal_url(), headers=read_headers)
+    assert resp.status_code == 200
+    assert resp.json()["meal"]["id"] == "meal-at-lookback"
+
+
+@pytest.mark.asyncio
+async def test_last_logged_meal_before_lookback_and_after_anchor_excluded(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            meal_events=[
+                _meal("meal-after-anchor", "2026-08-15T14:00:01.000Z"),
+                _meal("meal-before-lookback", "2026-07-16T13:59:59.000Z"),
+            ]
+        ),
+    )
+    resp = await client.get(_last_meal_url(), headers=read_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["meal"] is None
+    assert body["derived"] == {
+        "minutes_since_last_logged_meal": None,
+        "basis": None,
+    }
+    limits = " ".join(body["limits"]).lower()
+    assert "no logged meal" in limits
+    assert "fasting" in limits
+
+
+@pytest.mark.asyncio
+async def test_last_logged_meal_empty_window(
+    client: AsyncClient, read_headers: dict
+):
+    resp = await client.get(_last_meal_url(), headers=read_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["meal"] is None
+    assert body["derived"]["minutes_since_last_logged_meal"] is None
+    assert body["derived"]["basis"] is None
+    assert body["lookback_days"] == 30
+
+
+@pytest.mark.asyncio
+async def test_last_logged_meal_query_failed_sanitized(
+    client: AsyncClient, read_headers: dict
+):
+    with patch(
+        "app.services.query_service.HealthDataQueryService.resolve_personal_user",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("connection to postgresql://secret@db failed"),
+    ):
+        resp = await client.get(_last_meal_url(), headers=read_headers)
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "QUERY_FAILED"
+    assert "postgresql" not in resp.text.lower()
+    assert "secret" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_snapshot_meal_matches_last_logged_meal(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            meal_events=[
+                _meal("snap-meal", "2026-08-13T23:42:00.000Z", foods=[M2_FOOD]),
+            ]
+        ),
+    )
+    last_meal = await client.get(_last_meal_url(), headers=read_headers)
+    snapshot = await client.get(_snapshot_url(), headers=read_headers)
+    assert last_meal.status_code == snapshot.status_code == 200
+    assert snapshot.json()["last_logged_meal"] == last_meal.json()["meal"]
+    assert snapshot.json()["derived"] == last_meal.json()["derived"]
+    assert snapshot.json()["last_logged_meal"]["foods"] == [M2_FOOD]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_workout_bounds_and_ties(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            workouts=[
+                _workout(
+                    "wo-after-anchor",
+                    "2026-08-15T13:00:00.000Z",
+                    "2026-08-15T14:00:01.000Z",
+                ),
+                _workout(
+                    "wo-at-anchor",
+                    "2026-08-15T13:00:00.000Z",
+                    "2026-08-15T14:00:00.000Z",
+                ),
+                _workout(
+                    "wo-at-14d",
+                    "2026-08-01T13:00:00.000Z",
+                    "2026-08-01T14:00:00.000Z",
+                ),
+                _workout(
+                    "wo-before-14d",
+                    "2026-08-01T12:00:00.000Z",
+                    "2026-08-01T13:59:59.000Z",
+                ),
+            ]
+        ),
+    )
+    resp = await client.get(_snapshot_url(), headers=read_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["most_recent_workout"]["id"] == "wo-at-anchor"
+    assert "average_heart_rate" not in body["most_recent_workout"]
+    assert "active_energy_kcal" not in body["most_recent_workout"]
+    assert "source_name" not in body["most_recent_workout"]
+
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            workouts=[
+                _workout("wo-a", "2026-08-10T12:00:00.000Z", "2026-08-10T13:00:00.000Z"),
+                _workout("wo-z", "2026-08-10T12:00:00.000Z", "2026-08-10T13:00:00.000Z"),
+            ]
+        ),
+    )
+    tied = await client.get(
+        _snapshot_url(anchor="2026-08-10T13:00:00Z"), headers=read_headers
+    )
+    assert tied.json()["most_recent_workout"]["id"] == "wo-z"
+
+    only_bound = await client.get(
+        _snapshot_url(anchor="2026-08-15T14:00:00Z"),
+        headers=read_headers,
+    )
+    # After the second seed, wo-at-anchor is gone (truncate between tests? No, same test,
+    # truncate is per client fixture, second seed adds more workouts).
+    # The second seed does NOT truncate - ingest upserts. First workouts remain.
+    # Latest completed at the original anchor is still wo-at-anchor.
+    assert only_bound.json()["most_recent_workout"]["id"] == "wo-at-anchor"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_workout_14d_bound_included_and_before_excluded(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            workouts=[
+                _workout(
+                    "wo-at-14d",
+                    "2026-08-01T13:00:00.000Z",
+                    "2026-08-01T14:00:00.000Z",
+                ),
+                _workout(
+                    "wo-before-14d",
+                    "2026-08-01T12:00:00.000Z",
+                    "2026-08-01T13:59:59.000Z",
+                ),
+                _workout(
+                    "wo-after-anchor",
+                    "2026-08-15T13:30:00.000Z",
+                    "2026-08-15T14:00:01.000Z",
+                ),
+            ]
+        ),
+    )
+    included = await client.get(_snapshot_url(), headers=read_headers)
+    assert included.status_code == 200
+    assert included.json()["most_recent_workout"]["id"] == "wo-at-14d"
+
+    before_only = await client.get(
+        SNAPSHOT_PATH + "?" + _q(anchor="2026-08-01T13:59:59Z"),
+        headers=read_headers,
+    )
+    assert before_only.json()["most_recent_workout"]["id"] == "wo-before-14d"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_weight_latest_closed_bounds(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            weight_measurements=[
+                _weight("wt-at-anchor", "2026-08-15T14:00:00.000Z", 80.0),
+                _weight("wt-at-30d", "2026-07-16T14:00:00.000Z", 81.0),
+                _weight("wt-before-30d", "2026-07-16T13:59:59.000Z", 82.0),
+            ]
+        ),
+    )
+    resp = await client.get(_snapshot_url(), headers=read_headers)
+    assert resp.status_code == 200
+    item = resp.json()["most_recent_weight_measurement"]
+    assert item["id"] == "wt-at-anchor"
+    assert item["value_kg"] == 80.0
+    assert "source_name" not in item
+    assert "unit" not in item
+
+
+@pytest.mark.asyncio
+async def test_snapshot_weight_exactly_30d_included(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            weight_measurements=[
+                _weight("wt-at-30d", "2026-07-16T14:00:00.000Z", 81.0),
+            ]
+        ),
+    )
+    resp = await client.get(_snapshot_url(), headers=read_headers)
+    assert resp.json()["most_recent_weight_measurement"]["id"] == "wt-at-30d"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_stale_weight_unavailable(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            weight_measurements=[
+                _weight("wt-stale", "2026-07-16T13:59:59.000Z", 82.0),
+            ]
+        ),
+    )
+    resp = await client.get(_snapshot_url(), headers=read_headers)
+    body = resp.json()
+    assert body["most_recent_weight_measurement"] is None
+    assert {
+        "category": "most_recent_weight_measurement",
+        "reason": "no_record_in_lookback",
+    } in body["unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_sleep_overlap_and_aggregate(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            sleep_sessions=[
+                _sleep(
+                    "sl-overlap",
+                    "2026-08-14T13:00:00.000Z",
+                    "2026-08-14T15:00:00.000Z",
+                    "core",
+                ),
+                _sleep(
+                    "sl-end-at-window-start",
+                    "2026-08-14T12:00:00.000Z",
+                    "2026-08-14T14:00:00.000Z",
+                    "awake",
+                ),
+                _sleep(
+                    "sl-start-at-anchor",
+                    "2026-08-15T14:00:00.000Z",
+                    "2026-08-15T15:00:00.000Z",
+                    "rem",
+                ),
+                _sleep(
+                    "sl-late",
+                    "2026-08-15T02:13:00.000Z",
+                    "2026-08-15T09:01:00.000Z",
+                    "deep",
+                ),
+            ]
+        ),
+    )
+    resp = await client.get(_snapshot_url(), headers=read_headers)
+    assert resp.status_code == 200
+    sleep = resp.json()["recent_sleep_intervals"]
+    assert sleep["record_count"] == 2
+    assert sleep["first_start_time"].startswith("2026-08-14T13:00:00")
+    assert sleep["last_end_time"].startswith("2026-08-15T09:01:00")
+    assert sleep["sources"] == ["apple_health"]
+    assert "stage" not in sleep
+    assert "items" not in sleep
+    assert '"stage"' not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_snapshot_sleep_counts_beyond_list_page(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    intervals = [
+        _sleep(
+            f"sl-many-{i}",
+            f"2026-08-14T18:{i:02d}:00.000Z" if i < 60 else f"2026-08-14T19:{i - 60:02d}:00.000Z",
+            f"2026-08-14T18:{i:02d}:30.000Z" if i < 60 else f"2026-08-14T19:{i - 60:02d}:30.000Z",
+            "asleep",
+        )
+        for i in range(101)
+    ]
+    # Mix a second source on one row for distinct sorted sources.
+    intervals[0]["source"] = "manual"
+    await _seed(client, ingest_headers, _export_body(sleep_sessions=intervals))
+    resp = await client.get(_snapshot_url(), headers=read_headers)
+    assert resp.status_code == 200
+    sleep = resp.json()["recent_sleep_intervals"]
+    assert sleep["record_count"] == 101
+    assert sleep["sources"] == ["apple_health", "manual"]
+    assert "items" not in sleep
+
+
+@pytest.mark.asyncio
+async def test_snapshot_empty_sleep_and_glucose_unavailable(
+    client: AsyncClient, read_headers: dict
+):
+    resp = await client.get(_snapshot_url(), headers=read_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["recent_sleep_intervals"] == {
+        "record_count": 0,
+        "first_start_time": None,
+        "last_end_time": None,
+        "sources": [],
+    }
+    assert body["glucose_summary"]["sample_count"] == 0
+    assert body["glucose_summary"]["first_at"] is None
+    assert body["glucose_coverage"] == {
+        "count": 0,
+        "first_at": None,
+        "last_at": None,
+    }
+    assert body["last_logged_meal"] is None
+    assert body["most_recent_workout"] is None
+    assert body["most_recent_weight_measurement"] is None
+    assert body["derived"] == {
+        "minutes_since_last_logged_meal": None,
+        "basis": None,
+    }
+    reasons = {(item["category"], item["reason"]) for item in body["unavailable"]}
+    assert reasons == {
+        ("last_logged_meal", "no_record_in_lookback"),
+        ("most_recent_workout", "no_record_in_lookback"),
+        ("recent_sleep_intervals", "no_record_in_lookback"),
+        ("most_recent_weight_measurement", "no_record_in_lookback"),
+        ("glucose_coverage", "no_samples_in_window"),
+        ("glucose_summary", "no_samples_in_window"),
+    }
+    assert "points" not in body
+    assert "start" not in body
+    assert "end" not in body
+    limits = " ".join(body["limits"]).lower()
+    assert "fasting" in limits
+    assert "raw" in limits and "sleep" in limits
+    assert "medical advice" in limits
+
+
+@pytest.mark.asyncio
+async def test_snapshot_partial_data_and_no_sensitive_fields(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            meal_events=[_meal("partial-meal", "2026-08-13T23:42:00.000Z", foods=[M2_FOOD])],
+            workouts=[
+                _workout(
+                    "partial-wo",
+                    "2026-08-10T12:00:00.000Z",
+                    "2026-08-10T13:00:00.000Z",
+                )
+            ],
+        ),
+    )
+    records: list[str] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record.getMessage())
+
+    handler = _ListHandler()
+    handler.setLevel(logging.INFO)
+    query_logger.addHandler(handler)
+    previous_level = query_logger.level
+    previous_disabled = query_logger.disabled
+    query_logger.setLevel(logging.INFO)
+    query_logger.disabled = False
+    try:
+        resp = await client.get(_snapshot_url(), headers=read_headers)
+    finally:
+        query_logger.removeHandler(handler)
+        query_logger.setLevel(previous_level)
+        query_logger.disabled = previous_disabled
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["last_logged_meal"]["foods"] == [M2_FOOD]
+    assert body["most_recent_workout"]["id"] == "partial-wo"
+    assert body["recent_sleep_intervals"]["record_count"] == 0
+    assert body["most_recent_weight_measurement"] is None
+    assert body["glucose_summary"]["sample_count"] == 0
+    cats = {item["category"] for item in body["unavailable"]}
+    assert cats == {
+        "recent_sleep_intervals",
+        "most_recent_weight_measurement",
+        "glucose_coverage",
+        "glucose_summary",
+    }
+    assert "points" not in body
+    assert "notes" not in resp.text
+    assert "source_name" not in resp.text
+    assert "average_heart_rate" not in resp.text
+    assert "active_energy_kcal" not in resp.text
+    assert '"stage"' not in resp.text
+    log_text = "\n".join(records)
+    assert "query_access" in log_text
+    assert "anchor=" in log_text
+    assert M2_FOOD not in log_text
+    assert "partial-meal" not in log_text
+    assert "secret-note" not in log_text
+
+
+@pytest.mark.asyncio
+async def test_snapshot_query_failed_sanitized(client: AsyncClient, read_headers: dict):
+    with patch(
+        "app.services.query_service.HealthDataQueryService.resolve_personal_user",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("connection to postgresql://secret@db failed"),
+    ):
+        resp = await client.get(_snapshot_url(), headers=read_headers)
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "QUERY_FAILED"
+    assert "postgresql" not in resp.text.lower()
+    assert "secret" not in resp.text

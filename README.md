@@ -7,7 +7,7 @@ Personal FastAPI + PostgreSQL service that ingests an iOS HealthKit export, stor
 - Accept version-1 iOS export payloads via `POST /v1/ingest/batch`
 - Store one raw payload copy per ingestion batch (audit/debug)
 - Upsert typed rows keyed by `(user_id, source, source_sample_id)`
-- Expose Query API v1: `coverage`, `glucose/series`, `glucose/summary`, `meals`, `workouts`, `sleep-intervals`, `weight-measurements`
+- Expose Query API v1: `coverage`, `glucose/series`, `glucose/summary`, `meals`, `workouts`, `sleep-intervals`, `weight-measurements`, `last-logged-meal`, `context-snapshot`
 - Separate ingest (`INGEST_API_KEY`) and read (`READ_API_KEY`) credentials
 - Request ID on every response (persistent request-audit storage is deferred)
 
@@ -122,7 +122,7 @@ Identity is resolved server-side as `personal-primary`. Clients must **not** sen
 
 ## Query API v1
 
-All query endpoints are **read-only** and require explicit bounded time ranges (`start`, `end` as timezone-aware ISO-8601). Windows are half-open `[start, end)`. Default timezone: `America/New_York`.
+All query endpoints are **read-only**. List/coverage/glucose endpoints require explicit bounded time ranges (`start`, `end` as timezone-aware ISO-8601) using half-open `[start, end)`. `last-logged-meal` and `context-snapshot` take a timezone-aware `anchor` plus integer lookbacks (elapsed duration). Default timezone: `America/New_York`.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -133,8 +133,14 @@ All query endpoints are **read-only** and require explicit bounded time ranges (
 | GET | `/v1/query/workouts` | Workout intervals overlapping the window; cursor pagination |
 | GET | `/v1/query/sleep-intervals` | Raw sleep intervals overlapping the window; cursor pagination |
 | GET | `/v1/query/weight-measurements` | Weight measurements in `[start, end)`; cursor pagination |
+| GET | `/v1/query/last-logged-meal` | Latest logged meal at or before `anchor` (foods included, notes excluded) |
+| GET | `/v1/query/context-snapshot` | Bounded evidence-only snapshot around `anchor` (no glucose series) |
 
 Glucose resolution hard limits: raw 7d, 5m 31d, 15m 90d, hourly 365d (oversized ranges rejected). Hard ceiling of **10000** returned glucose points (raw or buckets) → `RESULT_TOO_LARGE`. List endpoints default `limit=100`, max `500` with HMAC-signed cursors bound to the resource and request range. Workout/weight windows max **365** days; sleep-interval windows max **90** days.
+
+`GET /v1/query/last-logged-meal` returns the latest logged meal at or before `anchor` (foods included, notes excluded; lookback default/max 30 elapsed days). Missing meals are HTTP 200 with `meal: null`. Time since last logged meal does not confirm fasting.
+
+`GET /v1/query/context-snapshot` returns a partial evidence-only envelope around `anchor`: last logged meal, most recent completed workout (14d), compact raw-sleep aggregate (default 24h, max 36h; no stages/list), most recent weight (30d), glucose-only coverage (`count` / `first_at` / `last_at`) plus overall summary (default 24h, max 48h). It does not return a glucose series. Empty resources are listed in `unavailable`.
 
 Workouts and sleep intervals use **interval overlap** for both coverage and list endpoints: `start_time < end AND end_time > start`. Coverage `first_at` / `last_at` are min/max stored `start_time` among included records (not `end_time`). Glucose, meals, and weight still count timestamps in `[start, end)` (`sample_time`, `meal_completed_at`, `measured_at`).
 
@@ -260,6 +266,22 @@ curl -sS \
   -H "Authorization: Bearer $READ_API_KEY" | python -m json.tool
 ```
 
+### Last logged meal
+
+```bash
+curl -sS \
+  "http://127.0.0.1:8000/v1/query/last-logged-meal?anchor=2026-08-15T14:00:00Z" \
+  -H "Authorization: Bearer $READ_API_KEY" | python -m json.tool
+```
+
+### Context snapshot
+
+```bash
+curl -sS \
+  "http://127.0.0.1:8000/v1/query/context-snapshot?anchor=2026-08-15T14:00:00Z" \
+  -H "Authorization: Bearer $READ_API_KEY" | python -m json.tool
+```
+
 ## Data privacy / logging policy
 
 **Logged (application logs, metadata only):** request ID, path, method, status, error type. Persistent per-request audit rows (`request_audit_logs`) are deferred to a later phase; the Phase 1 schema intentionally omits that table.
@@ -268,7 +290,7 @@ curl -sS \
 
 ## MCP service
 
-Standalone app in `mcp/`. Cursor authenticates with `MCP_API_KEY` only; the MCP service calls Query API with `READ_API_KEY`. Cursor never receives `READ_API_KEY` or `INGEST_API_KEY`.
+Standalone app in `mcp/`. Cursor authenticates with `MCP_API_KEY` only; the MCP service calls Query API with `READ_API_KEY`. Cursor never receives `READ_API_KEY` or `INGEST_API_KEY`. Nine read-only tools, including `get_last_logged_meal` and `build_context_snapshot`. See [docs/mcp.md](docs/mcp.md).
 
 ```bash
 cd mcp && pip install -e ".[dev]" && pytest

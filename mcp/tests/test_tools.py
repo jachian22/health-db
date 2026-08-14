@@ -9,9 +9,11 @@ import pytest
 from mcp import Client
 
 from mcp_service.tools import (
+    CONTEXT_SNAPSHOT_DESCRIPTION,
     COVERAGE_DESCRIPTION,
     GLUCOSE_SERIES_DESCRIPTION,
     GLUCOSE_SUMMARY_DESCRIPTION,
+    LAST_LOGGED_MEAL_DESCRIPTION,
     MEALS_DESCRIPTION,
     SLEEP_INTERVALS_DESCRIPTION,
     WEIGHT_MEASUREMENTS_DESCRIPTION,
@@ -28,6 +30,7 @@ from tests.conftest import (
     UNIQUE_WORKOUT_ID,
     FakeQueryClient,
     assert_no_secrets,
+    empty_last_logged_meal,
     empty_sleep_intervals,
 )
 
@@ -40,7 +43,7 @@ def _error_payload(result) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_lists_exactly_seven_tools(mcp_server):
+async def test_lists_exactly_nine_tools(mcp_server):
     async with Client(mcp_server) as client:
         listed = await client.list_tools()
     names = [tool.name for tool in listed.tools]
@@ -52,6 +55,8 @@ async def test_lists_exactly_seven_tools(mcp_server):
         "get_workouts",
         "get_sleep_intervals",
         "get_weight_measurements",
+        "get_last_logged_meal",
+        "build_context_snapshot",
     ]
     by_name = {tool.name: tool for tool in listed.tools}
     assert "Call this first when exploring an unfamiliar date range" in by_name[
@@ -64,6 +69,16 @@ async def test_lists_exactly_seven_tools(mcp_server):
     assert by_name["get_workouts"].description == WORKOUTS_DESCRIPTION
     assert by_name["get_sleep_intervals"].description == SLEEP_INTERVALS_DESCRIPTION
     assert by_name["get_weight_measurements"].description == WEIGHT_MEASUREMENTS_DESCRIPTION
+    assert by_name["get_last_logged_meal"].description == LAST_LOGGED_MEAL_DESCRIPTION
+    assert by_name["build_context_snapshot"].description == CONTEXT_SNAPSHOT_DESCRIPTION
+    assert "latest logged meal" in LAST_LOGGED_MEAL_DESCRIPTION.lower()
+    assert "foods are included" in LAST_LOGGED_MEAL_DESCRIPTION.lower()
+    assert "meal notes are excluded" in LAST_LOGGED_MEAL_DESCRIPTION.lower()
+    assert "does not establish fasting" in LAST_LOGGED_MEAL_DESCRIPTION.lower()
+    assert "no medical advice" in LAST_LOGGED_MEAL_DESCRIPTION.lower()
+    assert "bounded, evidence-only context" in CONTEXT_SNAPSHOT_DESCRIPTION.lower()
+    assert "does not return a glucose series" in CONTEXT_SNAPSHOT_DESCRIPTION.lower()
+    assert "does not confirm fasting" in CONTEXT_SNAPSHOT_DESCRIPTION.lower()
     assert "15m: maximum 90 days" in GLUCOSE_SERIES_DESCRIPTION
     assert "Daily grouping" in GLUCOSE_SUMMARY_DESCRIPTION
     assert "next_cursor" in MEALS_DESCRIPTION
@@ -316,3 +331,79 @@ async def test_get_weight_measurements_maps_to_query_client(
     assert item["value_kg"] == UNIQUE_KG
     assert "unit" not in item
     assert "lb" not in json.dumps(data)
+
+
+@pytest.mark.asyncio
+async def test_get_last_logged_meal_maps_to_query_client(
+    mcp_server, fake_query_client: FakeQueryClient
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "get_last_logged_meal",
+            {
+                "anchor": "2026-08-15T14:00:00Z",
+                "timezone": "America/New_York",
+                "lookback_days": 14,
+            },
+        )
+    assert result.is_error is False
+    assert fake_query_client.calls[0][0] == "last_logged_meal"
+    kwargs = fake_query_client.calls[0][1]
+    assert kwargs == {
+        "anchor": datetime(2026, 8, 15, 14, 0, tzinfo=UTC),
+        "timezone": "America/New_York",
+        "lookback_days": 14,
+    }
+    data = result.structured_content
+    assert data["meal"]["foods"] == [UNIQUE_FOOD]
+    assert data["lookback_days"] == 30
+    assert "notes" not in data["meal"]
+    assert_no_secrets(json.dumps(data))
+
+
+@pytest.mark.asyncio
+async def test_get_last_logged_meal_missing_passes_through_nulls(
+    mcp_server, fake_query_client: FakeQueryClient
+):
+    fake_query_client.last_logged_meal = empty_last_logged_meal()
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "get_last_logged_meal",
+            {"anchor": "2026-08-15T14:00:00Z"},
+        )
+    assert result.is_error is False
+    data = result.structured_content
+    assert data["meal"] is None
+    assert data["derived"]["minutes_since_last_logged_meal"] is None
+    assert data["derived"]["basis"] is None
+
+
+@pytest.mark.asyncio
+async def test_build_context_snapshot_maps_to_query_client(
+    mcp_server, fake_query_client: FakeQueryClient
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "build_context_snapshot",
+            {
+                "anchor": "2026-08-15T14:00:00Z",
+                "meal_lookback_days": 10,
+                "sleep_lookback_hours": 12,
+                "glucose_lookback_hours": 6,
+            },
+        )
+    assert result.is_error is False
+    assert fake_query_client.calls[0][0] == "context_snapshot"
+    kwargs = fake_query_client.calls[0][1]
+    assert kwargs == {
+        "anchor": datetime(2026, 8, 15, 14, 0, tzinfo=UTC),
+        "timezone": "America/New_York",
+        "meal_lookback_days": 10,
+        "sleep_lookback_hours": 12,
+        "glucose_lookback_hours": 6,
+    }
+    data = result.structured_content
+    assert data["last_logged_meal"]["foods"] == [UNIQUE_FOOD]
+    assert "points" not in data
+    assert "stage" not in data["recent_sleep_intervals"]
+    assert_no_secrets(json.dumps(data))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.core import (
@@ -120,6 +121,80 @@ def enforce_max_range_days(
             status_code=422,
             details={"max_days": max_days},
         )
+
+
+LOOKBACK_QUERY_FIELDS = frozenset(
+    {
+        "lookback_days",
+        "meal_lookback_days",
+        "sleep_lookback_hours",
+        "glucose_lookback_hours",
+    }
+)
+
+
+def remap_lookback_validation(errors: list[Any]) -> AppError | None:
+    """Map FastAPI/Pydantic lookback parse failures to INVALID_LOOKBACK (HTTP 422)."""
+    for err in errors:
+        loc = err.get("loc") or ()
+        field = next((part for part in loc if part in LOOKBACK_QUERY_FIELDS), None)
+        if field is not None:
+            return AppError(
+                code="INVALID_LOOKBACK",
+                message=f"{field} must be a positive integer",
+                status_code=422,
+            )
+    return None
+
+
+def validate_lookback(
+    value: str | int | None,
+    *,
+    default: int,
+    max_value: int,
+    unit: str,
+    field_name: str,
+    label: str,
+) -> int:
+    """Parse a positive integer lookback. Reject non-integers before FastAPI coercion."""
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise AppError(
+            code="INVALID_LOOKBACK",
+            message=f"{field_name} must be a positive integer",
+            status_code=422,
+        )
+    if isinstance(value, int):
+        parsed = value
+    else:
+        text = value.strip()
+        if text == "":
+            return default
+        negative = text.startswith("-")
+        digits = text[1:] if negative else text
+        if not digits.isdigit():
+            raise AppError(
+                code="INVALID_LOOKBACK",
+                message=f"{field_name} must be a positive integer",
+                status_code=422,
+            )
+        parsed = int(text)
+    if parsed <= 0:
+        raise AppError(
+            code="INVALID_LOOKBACK",
+            message=f"{field_name} must be a positive integer",
+            status_code=422,
+        )
+    if parsed > max_value:
+        detail_key = "max_days" if unit == "days" else "max_hours"
+        raise AppError(
+            code="RANGE_TOO_LARGE",
+            message=f"{label} is limited to {max_value} {unit}",
+            status_code=422,
+            details={detail_key: max_value},
+        )
+    return parsed
 
 
 def validate_page_limit(limit: int | None) -> int:

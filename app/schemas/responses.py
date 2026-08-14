@@ -176,3 +176,87 @@ class WeightMeasurementItem(BaseModel):
 
 class WeightMeasurementsResponse(PagedResponse[WeightMeasurementItem]):
     pass
+
+
+LAST_MEAL_DERIVED_BASIS = "anchor minus meal_completed_at of the latest logged meal"
+
+LAST_MEAL_LIMITS_FOUND = (
+    "Based only on the latest logged meal at or before the anchor time.",
+    "Time since last logged meal does not confirm fasting or account for unlogged food or caloric intake.",
+    "This response reports recorded data and transparent calculations only; it does not provide medical advice.",
+)
+
+LAST_MEAL_LIMITS_MISSING = (
+    "No logged meal was found within the requested lookback window.",
+    "Absence of a logged meal does not establish fasting.",
+    "This response reports recorded data and transparent calculations only; it does not provide medical advice.",
+)
+
+SNAPSHOT_LIMITS = (
+    "Time since last logged meal is based only on meal records that were logged.",
+    "It does not confirm fasting or account for unlogged food or caloric intake.",
+    "Sleep entries are raw synced intervals, not a sleep session or sleep-quality assessment.",
+    "This response reports recorded data and transparent calculations only; it does not diagnose, explain symptoms, assess safety, or provide medical advice.",
+)
+
+
+class LastMealDerived(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    minutes_since_last_logged_meal: float | None = None
+    basis: str | None = None
+
+
+class LastLoggedMealResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    anchor: datetime
+    timezone: str
+    lookback_days: int
+    meal: MealItem | None = None
+    derived: LastMealDerived
+    limits: list[str]
+
+
+class RecentSleepIntervals(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    record_count: int
+    first_start_time: datetime | None = None
+    last_end_time: datetime | None = None
+    sources: list[str] = Field(default_factory=list)
+
+
+class UnavailableItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    category: Literal[
+        "last_logged_meal",
+        "most_recent_workout",
+        "recent_sleep_intervals",
+        "most_recent_weight_measurement",
+        "glucose_coverage",
+        "glucose_summary",
+    ]
+    reason: Literal["no_record_in_lookback", "no_samples_in_window"]
+
+
+class ContextSnapshotResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    anchor: datetime
+    timezone: str
+    meal_lookback_days: int
+    sleep_lookback_hours: int
+    glucose_lookback_hours: int
+    last_logged_meal: MealItem | None = None
+    most_recent_workout: WorkoutItem | None = None
+    recent_sleep_intervals: RecentSleepIntervals
+    most_recent_weight_measurement: WeightMeasurementItem | None = None
+    glucose_coverage: CoverageCategory
+    glucose_summary: GlucoseSummaryStats
+    derived: LastMealDerived
+    unavailable: list[UnavailableItem] = Field(default_factory=list)
+    limits: list[str]

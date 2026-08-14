@@ -15,9 +15,11 @@ from pydantic import ValidationError
 from mcp_service.config import Settings
 from mcp_service.errors import QueryAPIError
 from mcp_service.models import (
+    ContextSnapshotResponse,
     CoverageResponse,
     GlucoseSeriesResponse,
     GlucoseSummaryResponse,
+    LastLoggedMealResponse,
     MealsResponse,
     SleepIntervalsResponse,
     WeightMeasurementsResponse,
@@ -32,6 +34,8 @@ MEALS_PATH = "/v1/query/meals"
 WORKOUTS_PATH = "/v1/query/workouts"
 SLEEP_INTERVALS_PATH = "/v1/query/sleep-intervals"
 WEIGHT_MEASUREMENTS_PATH = "/v1/query/weight-measurements"
+LAST_LOGGED_MEAL_PATH = "/v1/query/last-logged-meal"
+CONTEXT_SNAPSHOT_PATH = "/v1/query/context-snapshot"
 READY_PATH = "/ready"
 
 _SAFE_UNAVAILABLE = "The health data service is unavailable"
@@ -199,6 +203,44 @@ class HealthDBQueryAPIClient:
             limit=limit,
             cursor=cursor,
         )
+
+    async def get_last_logged_meal(
+        self,
+        *,
+        anchor: datetime,
+        timezone: str,
+        lookback_days: int,
+    ) -> LastLoggedMealResponse:
+        data = await self._request(
+            LAST_LOGGED_MEAL_PATH,
+            {
+                "anchor": to_iso8601(anchor),
+                "timezone": timezone,
+                "lookback_days": lookback_days,
+            },
+        )
+        return self._parse(LastLoggedMealResponse, data)
+
+    async def get_context_snapshot(
+        self,
+        *,
+        anchor: datetime,
+        timezone: str,
+        meal_lookback_days: int,
+        sleep_lookback_hours: int,
+        glucose_lookback_hours: int,
+    ) -> ContextSnapshotResponse:
+        data = await self._request(
+            CONTEXT_SNAPSHOT_PATH,
+            {
+                "anchor": to_iso8601(anchor),
+                "timezone": timezone,
+                "meal_lookback_days": meal_lookback_days,
+                "sleep_lookback_hours": sleep_lookback_hours,
+                "glucose_lookback_hours": glucose_lookback_hours,
+            },
+        )
+        return self._parse(ContextSnapshotResponse, data)
 
     async def _get_paged[T](
         self,

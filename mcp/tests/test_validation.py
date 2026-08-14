@@ -308,3 +308,104 @@ async def test_new_tools_cursor_passed_through_opaque(
         )
     assert result.is_error is False
     assert fake_query_client.calls[0][1]["cursor"] == cursor
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["get_last_logged_meal", "build_context_snapshot"])
+async def test_m2_tools_naive_anchor_rejected(
+    mcp_server, fake_query_client: FakeQueryClient, tool_name: str
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            tool_name,
+            {"anchor": "2026-08-15T14:00:00"},
+        )
+    assert result.is_error is True
+    body = _payload(result)
+    assert body.get("code") == "INVALID_TIME_RANGE"
+    assert fake_query_client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["get_last_logged_meal", "build_context_snapshot"])
+async def test_m2_tools_invalid_timezone_rejected(
+    mcp_server, fake_query_client: FakeQueryClient, tool_name: str
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            tool_name,
+            {"anchor": "2026-08-15T14:00:00Z", "timezone": "Not/A_Zone"},
+        )
+    assert result.is_error is True
+    body = _payload(result)
+    assert body.get("code") == "INVALID_TIMEZONE"
+    assert fake_query_client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "param"),
+    [
+        ("get_last_logged_meal", "lookback_days"),
+        ("build_context_snapshot", "meal_lookback_days"),
+        ("build_context_snapshot", "sleep_lookback_hours"),
+        ("build_context_snapshot", "glucose_lookback_hours"),
+    ],
+)
+@pytest.mark.parametrize("bad", [0, -1])
+async def test_m2_tools_invalid_lookback_rejected_before_upstream(
+    mcp_server, fake_query_client: FakeQueryClient, tool_name: str, param: str, bad: int
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            tool_name,
+            {"anchor": "2026-08-15T14:00:00Z", param: bad},
+        )
+    assert result.is_error is True
+    body = _payload(result)
+    assert body.get("code") == "INVALID_LOOKBACK"
+    assert fake_query_client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "param", "too_big", "max_key", "max_value"),
+    [
+        ("get_last_logged_meal", "lookback_days", 31, "max_days", 30),
+        ("build_context_snapshot", "meal_lookback_days", 31, "max_days", 30),
+        ("build_context_snapshot", "sleep_lookback_hours", 37, "max_hours", 36),
+        ("build_context_snapshot", "glucose_lookback_hours", 49, "max_hours", 48),
+    ],
+)
+async def test_m2_tools_lookback_too_large_rejected_before_upstream(
+    mcp_server,
+    fake_query_client: FakeQueryClient,
+    tool_name: str,
+    param: str,
+    too_big: int,
+    max_key: str,
+    max_value: int,
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            tool_name,
+            {"anchor": "2026-08-15T14:00:00Z", param: too_big},
+        )
+    assert result.is_error is True
+    body = _payload(result)
+    assert body["code"] == "RANGE_TOO_LARGE"
+    assert body[max_key] == max_value
+    assert fake_query_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_m2_tools_non_integer_lookback_rejected_before_upstream(
+    mcp_server, fake_query_client: FakeQueryClient
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "get_last_logged_meal",
+            {"anchor": "2026-08-15T14:00:00Z", "lookback_days": "abc"},
+        )
+    assert result.is_error is True
+    assert fake_query_client.calls == []

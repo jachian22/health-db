@@ -5,7 +5,8 @@ from __future__ import annotations
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Annotated, Literal, Protocol
 
 from mcp.server import MCPServer
@@ -14,9 +15,15 @@ from pydantic import Field
 
 from mcp_service.config import Settings
 from mcp_service.constants import (
+    DEFAULT_GLUCOSE_LOOKBACK_HOURS,
+    DEFAULT_MEAL_LOOKBACK_DAYS,
     DEFAULT_PAGE_LIMIT,
     DEFAULT_QUERY_TIMEZONE,
+    DEFAULT_SLEEP_LOOKBACK_HOURS,
+    MAX_GLUCOSE_LOOKBACK_HOURS,
+    MAX_MEAL_LOOKBACK_DAYS,
     MAX_PAGE_LIMIT,
+    MAX_SLEEP_LOOKBACK_HOURS,
     MAX_SLEEP_RANGE_DAYS,
     MAX_WEIGHT_RANGE_DAYS,
     MAX_WORKOUT_RANGE_DAYS,
@@ -24,9 +31,11 @@ from mcp_service.constants import (
 from mcp_service.errors import QueryAPIError, ToolError
 from mcp_service.logging import current_request_id, log_request
 from mcp_service.models import (
+    ContextSnapshotResponse,
     CoverageResponse,
     GlucoseSeriesResponse,
     GlucoseSummaryResponse,
+    LastLoggedMealResponse,
     MealsResponse,
     SleepIntervalsResponse,
     WeightMeasurementsResponse,
@@ -34,9 +43,11 @@ from mcp_service.models import (
     coverage_record_count,
     enforce_glucose_range_limit,
     enforce_max_range_days,
+    parse_bound_timestamp,
     parse_timezone,
     summary_record_count,
     to_iso8601,
+    validate_lookback,
     validate_page_limit,
     validate_time_range,
 )
@@ -110,11 +121,36 @@ WEIGHT_MEASUREMENTS_DESCRIPTION = (
     "Use returned next_cursor to fetch later pages only when necessary."
 )
 
+LAST_LOGGED_MEAL_DESCRIPTION = (
+    "Return the latest logged meal at or before a required timezone-aware anchor. "
+    "Foods are included. Meal notes are excluded. "
+    f"lookback_days defaults to {DEFAULT_MEAL_LOOKBACK_DAYS} and cannot exceed "
+    f"{MAX_MEAL_LOOKBACK_DAYS}. "
+    "Time since last logged meal is based only on logged meals. "
+    "It does not establish fasting or account for unlogged food. "
+    "It provides no medical advice, diagnosis, or clinical interpretation."
+)
+
+CONTEXT_SNAPSHOT_DESCRIPTION = (
+    "Return bounded, evidence-only context around a required timezone-aware anchor. "
+    "Includes the latest logged meal and foods when present (notes excluded), "
+    "the most recent completed workout, a compact raw-sleep aggregate "
+    "(not a sleep session or stage list), the most recent weight measurement, "
+    "glucose coverage, and a descriptive overall glucose summary. "
+    "It does not return a glucose series. "
+    "Time since last logged meal does not confirm fasting. "
+    "It does not diagnose, infer symptoms or causality, assess safety or readiness, "
+    "or give medical advice or clinical interpretation."
+)
+
 Start = Annotated[
     datetime, Field(description="Inclusive range start (ISO-8601 with timezone)")
 ]
 End = Annotated[
     datetime, Field(description="Exclusive range end (ISO-8601 with timezone)")
+]
+Anchor = Annotated[
+    datetime, Field(description="Timezone-aware ISO-8601 timestamp")
 ]
 Timezone = Annotated[
     str, Field(description=f"IANA timezone (default {DEFAULT_QUERY_TIMEZONE})")
@@ -190,82 +226,166 @@ class QueryClient(Protocol):
         cursor: str | None = None,
     ) -> WeightMeasurementsResponse: ...
 
+    async def get_last_logged_meal(
+        self,
+        *,
+        anchor: datetime,
+        timezone: str,
+        lookback_days: int,
+    ) -> LastLoggedMealResponse: ...
+
+    async def get_context_snapshot(
+        self,
+        *,
+        anchor: datetime,
+        timezone: str,
+        meal_lookback_days: int,
+        sleep_lookback_hours: int,
+        glucose_lookback_hours: int,
+    ) -> ContextSnapshotResponse: ...
+
 
 def _window(start: datetime, end: datetime, timezone: str) -> tuple[datetime, datetime, str]:
     start_utc, end_utc = validate_time_range(start, end)
     return start_utc, end_utc, parse_timezone(timezone)
 
 
-async def _run_tool[T](
-    *,
-    tool_name: str,
+def _iso(value: datetime) -> str | None:
+    return to_iso8601(value) if value.tzinfo else None
+
+
+@dataclass(frozen=True)
+class ToolLogMeta:
+    start: str | None = None
+    end: str | None = None
+    timezone: str | None = None
+    resolution: str | None = None
+    bucket: str | None = None
+    record_count: int | None = None
+    truncated: bool | None = None
+    anchor: str | None = None
+    lookback_days: int | None = None
+    meal_lookback_days: int | None = None
+    sleep_lookback_hours: int | None = None
+    glucose_lookback_hours: int | None = None
+
+
+def _bounds_meta(
     start: datetime,
     end: datetime,
     timezone: str,
-    call: Callable[[], Awaitable[T]],
-    count_of: Callable[[T], int],
-    truncated_of: Callable[[T], bool] | None = None,
+    *,
+    record_count: int | None = None,
+    truncated: bool | None = None,
     resolution: str | None = None,
     bucket: str | None = None,
+) -> ToolLogMeta:
+    return ToolLogMeta(
+        start=_iso(start),
+        end=_iso(end),
+        timezone=timezone,
+        record_count=record_count,
+        truncated=truncated,
+        resolution=resolution,
+        bucket=bucket,
+    )
+
+
+def _last_meal_log_meta(result: LastLoggedMealResponse) -> ToolLogMeta:
+    window_start = result.anchor - timedelta(days=result.lookback_days)
+    return ToolLogMeta(
+        start=to_iso8601(window_start),
+        end=to_iso8601(result.anchor),
+        timezone=result.timezone,
+        record_count=0 if result.meal is None else 1,
+        anchor=to_iso8601(result.anchor),
+        lookback_days=result.lookback_days,
+    )
+
+
+def _snapshot_log_meta(result: ContextSnapshotResponse) -> ToolLogMeta:
+    return ToolLogMeta(
+        timezone=result.timezone,
+        record_count=result.recent_sleep_intervals.record_count,
+        anchor=to_iso8601(result.anchor),
+        meal_lookback_days=result.meal_lookback_days,
+        sleep_lookback_hours=result.sleep_lookback_hours,
+        glucose_lookback_hours=result.glucose_lookback_hours,
+    )
+
+
+def _log_tool(
+    *,
+    tool_name: str,
+    outcome: str,
+    latency_ms: float,
+    meta: ToolLogMeta,
+    error_code: str | None = None,
+) -> None:
+    log_request(
+        request_id=current_request_id(),
+        category="tools/call",
+        tool_name=tool_name,
+        outcome=outcome,
+        principal="mcp_caller",
+        start=meta.start,
+        end=meta.end,
+        timezone=meta.timezone,
+        resolution=meta.resolution,
+        bucket=meta.bucket,
+        record_count=meta.record_count,
+        truncated=meta.truncated,
+        latency_ms=latency_ms,
+        error_code=error_code,
+        anchor=meta.anchor,
+        lookback_days=meta.lookback_days,
+        meal_lookback_days=meta.meal_lookback_days,
+        sleep_lookback_hours=meta.sleep_lookback_hours,
+        glucose_lookback_hours=meta.glucose_lookback_hours,
+    )
+
+
+async def _run_tool[T](
+    *,
+    tool_name: str,
+    call: Callable[[], Awaitable[T]],
+    success_meta: Callable[[T], ToolLogMeta],
+    error_meta: ToolLogMeta,
 ) -> T:
-    request_id = current_request_id()
     started = time.perf_counter()
     try:
         result = await call()
         latency_ms = (time.perf_counter() - started) * 1000
-        truncated = truncated_of(result) if truncated_of else None
-        log_request(
-            request_id=request_id,
-            category="tools/call",
+        _log_tool(
             tool_name=tool_name,
             outcome="ok",
-            principal="mcp_caller",
-            start=to_iso8601(start),
-            end=to_iso8601(end),
-            timezone=timezone,
-            resolution=resolution,
-            bucket=bucket,
-            record_count=count_of(result),
-            truncated=truncated,
             latency_ms=latency_ms,
+            meta=success_meta(result),
         )
         return result
     except ToolError as exc:
         latency_ms = (time.perf_counter() - started) * 1000
-        log_request(
-            request_id=request_id,
-            category="tools/call",
+        _log_tool(
             tool_name=tool_name,
             outcome="validation_error",
-            principal="mcp_caller",
-            start=to_iso8601(start) if start.tzinfo else None,
-            end=to_iso8601(end) if end.tzinfo else None,
-            timezone=timezone,
-            resolution=resolution,
-            bucket=bucket,
             latency_ms=latency_ms,
+            meta=error_meta,
             error_code=exc.code,
         )
+        request_id = current_request_id()
         if "request_id" not in exc.extra:
             raise ToolError(exc.code, exc.message, request_id=request_id, **exc.extra) from exc
         raise
     except QueryAPIError as exc:
         latency_ms = (time.perf_counter() - started) * 1000
-        log_request(
-            request_id=request_id,
-            category="tools/call",
+        _log_tool(
             tool_name=tool_name,
             outcome=exc.code.lower(),
-            principal="mcp_caller",
-            start=to_iso8601(start),
-            end=to_iso8601(end),
-            timezone=timezone,
-            resolution=resolution,
-            bucket=bucket,
             latency_ms=latency_ms,
+            meta=error_meta,
             error_code=exc.code,
         )
-        raise exc.to_tool_error(request_id=request_id) from exc
+        raise exc.to_tool_error(request_id=current_request_id()) from exc
 
 
 async def _run_paged_tool[T](
@@ -292,12 +412,15 @@ async def _run_paged_tool[T](
 
     return await _run_tool(
         tool_name=tool_name,
-        start=start,
-        end=end,
-        timezone=timezone,
         call=_call,
-        count_of=lambda result: result.record_count,  # type: ignore[attr-defined]
-        truncated_of=lambda result: result.truncated,  # type: ignore[attr-defined]
+        success_meta=lambda result: _bounds_meta(
+            start,
+            end,
+            timezone,
+            record_count=result.record_count,  # type: ignore[attr-defined]
+            truncated=result.truncated,  # type: ignore[attr-defined]
+        ),
+        error_meta=_bounds_meta(start, end, timezone),
     )
 
 
@@ -315,7 +438,8 @@ def build_mcp_server(
             "Typical workflow: get_data_coverage, then get_meals / get_workouts / "
             "get_sleep_intervals / get_weight_measurements, "
             "then get_glucose_series, then get_glucose_summary. "
-            "Always use explicit timezone-aware start/end. "
+            "Use get_last_logged_meal or build_context_snapshot for anchor-relative context. "
+            "Always use explicit timezone-aware start/end or a timezone-aware anchor. "
             "Workouts and sleep intervals use overlap inclusion "
             "(start_time < end AND end_time > start) for both coverage and lists. "
             "Do not give medical advice, diagnosis, or clinical interpretation."
@@ -336,11 +460,11 @@ def build_mcp_server(
 
         return await _run_tool(
             tool_name="get_data_coverage",
-            start=start,
-            end=end,
-            timezone=timezone,
             call=_call,
-            count_of=coverage_record_count,
+            success_meta=lambda result: _bounds_meta(
+                start, end, timezone, record_count=coverage_record_count(result)
+            ),
+            error_meta=_bounds_meta(start, end, timezone),
         )
 
     @mcp.tool(
@@ -366,13 +490,16 @@ def build_mcp_server(
 
         return await _run_tool(
             tool_name="get_glucose_series",
-            start=start,
-            end=end,
-            timezone=timezone,
-            resolution=resolution,
             call=_call,
-            count_of=lambda r: r.returned_point_count,
-            truncated_of=lambda r: r.truncated,
+            success_meta=lambda result: _bounds_meta(
+                start,
+                end,
+                timezone,
+                record_count=result.returned_point_count,
+                truncated=result.truncated,
+                resolution=resolution,
+            ),
+            error_meta=_bounds_meta(start, end, timezone, resolution=resolution),
         )
 
     @mcp.tool(
@@ -397,12 +524,15 @@ def build_mcp_server(
 
         return await _run_tool(
             tool_name="get_glucose_summary",
-            start=start,
-            end=end,
-            timezone=timezone,
-            bucket=bucket,
             call=_call,
-            count_of=summary_record_count,
+            success_meta=lambda result: _bounds_meta(
+                start,
+                end,
+                timezone,
+                record_count=summary_record_count(result),
+                bucket=bucket,
+            ),
+            error_meta=_bounds_meta(start, end, timezone, bucket=bucket),
         )
 
     @mcp.tool(name="get_meals", description=MEALS_DESCRIPTION, annotations=read_only)
@@ -512,6 +642,134 @@ def build_mcp_server(
                     limit=resolved_limit,
                     cursor=cursor,
                 )
+            ),
+        )
+
+    @mcp.tool(
+        name="get_last_logged_meal",
+        description=LAST_LOGGED_MEAL_DESCRIPTION,
+        annotations=read_only,
+    )
+    async def get_last_logged_meal(
+        anchor: Anchor,
+        timezone: Timezone = DEFAULT_QUERY_TIMEZONE,
+        lookback_days: Annotated[
+            int,
+            Field(
+                description=(
+                    "Elapsed-day lookback "
+                    f"(default {DEFAULT_MEAL_LOOKBACK_DAYS}, max {MAX_MEAL_LOOKBACK_DAYS})"
+                )
+            ),
+        ] = DEFAULT_MEAL_LOOKBACK_DAYS,
+    ) -> LastLoggedMealResponse:
+        async def _call() -> LastLoggedMealResponse:
+            anchor_utc = parse_bound_timestamp(anchor, field_name="anchor")
+            tz = parse_timezone(timezone)
+            resolved = validate_lookback(
+                lookback_days,
+                default=DEFAULT_MEAL_LOOKBACK_DAYS,
+                max_value=MAX_MEAL_LOOKBACK_DAYS,
+                unit="days",
+                field_name="lookback_days",
+                label="Meal lookback",
+            )
+            return await query_client.get_last_logged_meal(
+                anchor=anchor_utc, timezone=tz, lookback_days=resolved
+            )
+
+        return await _run_tool(
+            tool_name="get_last_logged_meal",
+            call=_call,
+            success_meta=_last_meal_log_meta,
+            error_meta=ToolLogMeta(
+                timezone=timezone,
+                anchor=_iso(anchor),
+                lookback_days=lookback_days,
+            ),
+        )
+
+    @mcp.tool(
+        name="build_context_snapshot",
+        description=CONTEXT_SNAPSHOT_DESCRIPTION,
+        annotations=read_only,
+    )
+    async def build_context_snapshot(
+        anchor: Anchor,
+        timezone: Timezone = DEFAULT_QUERY_TIMEZONE,
+        meal_lookback_days: Annotated[
+            int,
+            Field(
+                description=(
+                    "Elapsed-day meal lookback "
+                    f"(default {DEFAULT_MEAL_LOOKBACK_DAYS}, max {MAX_MEAL_LOOKBACK_DAYS})"
+                )
+            ),
+        ] = DEFAULT_MEAL_LOOKBACK_DAYS,
+        sleep_lookback_hours: Annotated[
+            int,
+            Field(
+                description=(
+                    "Elapsed-hour sleep lookback "
+                    f"(default {DEFAULT_SLEEP_LOOKBACK_HOURS}, max {MAX_SLEEP_LOOKBACK_HOURS})"
+                )
+            ),
+        ] = DEFAULT_SLEEP_LOOKBACK_HOURS,
+        glucose_lookback_hours: Annotated[
+            int,
+            Field(
+                description=(
+                    "Elapsed-hour glucose lookback "
+                    f"(default {DEFAULT_GLUCOSE_LOOKBACK_HOURS}, max {MAX_GLUCOSE_LOOKBACK_HOURS})"
+                )
+            ),
+        ] = DEFAULT_GLUCOSE_LOOKBACK_HOURS,
+    ) -> ContextSnapshotResponse:
+        async def _call() -> ContextSnapshotResponse:
+            anchor_utc = parse_bound_timestamp(anchor, field_name="anchor")
+            tz = parse_timezone(timezone)
+            meal_lb = validate_lookback(
+                meal_lookback_days,
+                default=DEFAULT_MEAL_LOOKBACK_DAYS,
+                max_value=MAX_MEAL_LOOKBACK_DAYS,
+                unit="days",
+                field_name="meal_lookback_days",
+                label="Meal lookback",
+            )
+            sleep_lb = validate_lookback(
+                sleep_lookback_hours,
+                default=DEFAULT_SLEEP_LOOKBACK_HOURS,
+                max_value=MAX_SLEEP_LOOKBACK_HOURS,
+                unit="hours",
+                field_name="sleep_lookback_hours",
+                label="Sleep lookback",
+            )
+            glucose_lb = validate_lookback(
+                glucose_lookback_hours,
+                default=DEFAULT_GLUCOSE_LOOKBACK_HOURS,
+                max_value=MAX_GLUCOSE_LOOKBACK_HOURS,
+                unit="hours",
+                field_name="glucose_lookback_hours",
+                label="Glucose lookback",
+            )
+            return await query_client.get_context_snapshot(
+                anchor=anchor_utc,
+                timezone=tz,
+                meal_lookback_days=meal_lb,
+                sleep_lookback_hours=sleep_lb,
+                glucose_lookback_hours=glucose_lb,
+            )
+
+        return await _run_tool(
+            tool_name="build_context_snapshot",
+            call=_call,
+            success_meta=_snapshot_log_meta,
+            error_meta=ToolLogMeta(
+                timezone=timezone,
+                anchor=_iso(anchor),
+                meal_lookback_days=meal_lookback_days,
+                sleep_lookback_hours=sleep_lookback_hours,
+                glucose_lookback_hours=glucose_lookback_hours,
             ),
         )
 

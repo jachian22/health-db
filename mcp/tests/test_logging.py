@@ -53,12 +53,22 @@ async def test_logs_safe_metadata_not_health_values(
             "get_weight_measurements",
             {"start": "2026-08-01T00:00:00Z", "end": "2026-08-12T00:00:00Z"},
         )
+        await client.call_tool(
+            "get_last_logged_meal",
+            {"anchor": "2026-08-15T14:00:00Z"},
+        )
+        await client.call_tool(
+            "build_context_snapshot",
+            {"anchor": "2026-08-15T14:00:00Z"},
+        )
     text = caplog.text
     assert "get_glucose_series" in text
     assert "get_meals" in text
     assert "get_workouts" in text
     assert "get_sleep_intervals" in text
     assert "get_weight_measurements" in text
+    assert "get_last_logged_meal" in text
+    assert "build_context_snapshot" in text
     assert "latency_ms=" in text
     assert "outcome=ok" in text
     assert "http_status=" not in text

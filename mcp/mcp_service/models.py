@@ -164,6 +164,58 @@ class WeightMeasurementsResponse(PagedResponse[WeightMeasurementItem]):
     pass
 
 
+class LastMealDerived(QueryModel):
+    minutes_since_last_logged_meal: float | None = None
+    basis: str | None = None
+
+
+class LastLoggedMealResponse(QueryModel):
+    request_id: str
+    anchor: datetime
+    timezone: str
+    lookback_days: int
+    meal: MealItem | None = None
+    derived: LastMealDerived
+    limits: list[str]
+
+
+class RecentSleepIntervals(QueryModel):
+    record_count: int
+    first_start_time: datetime | None = None
+    last_end_time: datetime | None = None
+    sources: list[str] = Field(default_factory=list)
+
+
+class UnavailableItem(QueryModel):
+    category: Literal[
+        "last_logged_meal",
+        "most_recent_workout",
+        "recent_sleep_intervals",
+        "most_recent_weight_measurement",
+        "glucose_coverage",
+        "glucose_summary",
+    ]
+    reason: Literal["no_record_in_lookback", "no_samples_in_window"]
+
+
+class ContextSnapshotResponse(QueryModel):
+    request_id: str
+    anchor: datetime
+    timezone: str
+    meal_lookback_days: int
+    sleep_lookback_hours: int
+    glucose_lookback_hours: int
+    last_logged_meal: MealItem | None = None
+    most_recent_workout: WorkoutItem | None = None
+    recent_sleep_intervals: RecentSleepIntervals
+    most_recent_weight_measurement: WeightMeasurementItem | None = None
+    glucose_coverage: CoverageCategory
+    glucose_summary: GlucoseSummaryStats
+    derived: LastMealDerived
+    unavailable: list[UnavailableItem] = Field(default_factory=list)
+    limits: list[str]
+
+
 def to_iso8601(value: datetime) -> str:
     text = value.isoformat()
     if text.endswith("+00:00"):
@@ -246,6 +298,51 @@ def validate_page_limit(limit: int | None) -> int:
             max_limit=MAX_PAGE_LIMIT,
         )
     return limit
+
+
+def validate_lookback(
+    value: object,
+    *,
+    default: int,
+    max_value: int,
+    unit: str,
+    field_name: str,
+    label: str,
+) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ToolError(
+            code="INVALID_LOOKBACK",
+            message=f"{field_name} must be a positive integer",
+        )
+    if isinstance(value, int):
+        parsed = value
+    else:
+        text = value.strip()
+        if text == "":
+            return default
+        negative = text.startswith("-")
+        digits = text[1:] if negative else text
+        if not digits.isdigit():
+            raise ToolError(
+                code="INVALID_LOOKBACK",
+                message=f"{field_name} must be a positive integer",
+            )
+        parsed = int(text)
+    if parsed <= 0:
+        raise ToolError(
+            code="INVALID_LOOKBACK",
+            message=f"{field_name} must be a positive integer",
+        )
+    if parsed > max_value:
+        extra_key = "max_days" if unit == "days" else "max_hours"
+        raise ToolError(
+            code="RANGE_TOO_LARGE",
+            message=f"{label} is limited to {max_value} {unit}",
+            **{extra_key: max_value},
+        )
+    return parsed
 
 
 def summary_record_count(result: GlucoseSummaryResponse) -> int:

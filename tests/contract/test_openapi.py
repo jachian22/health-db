@@ -21,6 +21,8 @@ async def test_openapi_documents_query_api_v1(client: AsyncClient):
     assert "/v1/query/workouts" in paths
     assert "/v1/query/sleep-intervals" in paths
     assert "/v1/query/weight-measurements" in paths
+    assert "/v1/query/last-logged-meal" in paths
+    assert "/v1/query/context-snapshot" in paths
     assert "/health" in paths
     assert "/ready" in paths
 
@@ -68,6 +70,28 @@ async def test_openapi_documents_query_api_v1(client: AsyncClient):
     weight = paths["/v1/query/weight-measurements"]["get"]
     assert "365" in weight["description"]
     assert "kg" in weight["description"].lower()
+
+    last_meal = paths["/v1/query/last-logged-meal"]["get"]
+    assert "post" not in paths["/v1/query/last-logged-meal"]
+    last_meal_desc = last_meal["description"].lower()
+    assert "read-only" in last_meal_desc
+    assert "latest logged meal" in last_meal_desc
+    assert "foods" in last_meal_desc
+    assert "notes" in last_meal_desc
+    assert "fasting" in last_meal_desc
+    assert "medical advice" in last_meal_desc or "interpretation" in last_meal_desc
+
+    snapshot = paths["/v1/query/context-snapshot"]["get"]
+    assert "post" not in paths["/v1/query/context-snapshot"]
+    snapshot_desc = snapshot["description"].lower()
+    assert "read-only" in snapshot_desc
+    assert "latest logged meal" in snapshot_desc
+    assert "foods" in snapshot_desc
+    assert "notes" in snapshot_desc
+    assert "fasting" in snapshot_desc
+    assert "raw" in snapshot_desc and "sleep" in snapshot_desc
+    assert "glucose series" in snapshot_desc
+    assert "medical advice" in snapshot_desc or "interpretation" in snapshot_desc
 
     # Error schema exists
     schemas = spec["components"]["schemas"]

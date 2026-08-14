@@ -42,7 +42,8 @@ def create_app() -> FastAPI:
             "- Query API ranges are half-open `[start, end)` and require timezone-aware "
             "ISO-8601 `start` / `end` parameters.\n"
             "- Default display/aggregation timezone: `America/New_York`.\n"
-            "- All query endpoints are read-only and require explicit bounded time ranges.\n"
+            "- All query endpoints are read-only and require explicit bounded time ranges "
+            "or a timezone-aware `anchor` with lookback windows.\n"
             "- Glucose units: mg/dL. Weight units: kg.\n"
             "- Query API uses `READ_API_KEY`; ingest uses `INGEST_API_KEY` "
             "(keys are not interchangeable).\n"
@@ -95,6 +96,7 @@ def _mount_phase1(application: FastAPI) -> None:
     from app.api.v1 import ingest, query
     from app.core.config import get_settings
     from app.core.request_id import RequestIdMiddleware
+    from app.schemas.queries import remap_lookback_validation
 
     settings = get_settings()
 
@@ -145,6 +147,9 @@ def _mount_phase1(application: FastAPI) -> None:
 
     @application.exception_handler(RequestValidationError)
     async def validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        lookback_error = remap_lookback_validation(exc.errors())
+        if lookback_error is not None:
+            return await app_error_handler(request, lookback_error)
         request_id = getattr(request.state, "request_id", "unknown")
         request.state.error_code = "INVALID_REQUEST"
         return JSONResponse(

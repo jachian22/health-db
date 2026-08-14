@@ -18,15 +18,23 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, literal, select, text, union_all
+from sqlalchemy import distinct, func, literal, select, text, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import (
+    DEFAULT_GLUCOSE_LOOKBACK_HOURS,
+    DEFAULT_MEAL_LOOKBACK_DAYS,
+    DEFAULT_SLEEP_LOOKBACK_HOURS,
+    MAX_GLUCOSE_LOOKBACK_HOURS,
     MAX_GLUCOSE_POINTS,
+    MAX_MEAL_LOOKBACK_DAYS,
+    MAX_SLEEP_LOOKBACK_HOURS,
     MAX_SLEEP_RANGE_DAYS,
     MAX_WEIGHT_RANGE_DAYS,
     MAX_WORKOUT_RANGE_DAYS,
     RESOLUTION_SECONDS,
+    SNAPSHOT_WEIGHT_LOOKBACK_DAYS,
+    SNAPSHOT_WORKOUT_LOOKBACK_DAYS,
 )
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
@@ -35,13 +43,20 @@ from app.schemas.queries import (
     enforce_glucose_point_limit,
     enforce_glucose_range_limit,
     enforce_max_range_days,
+    parse_bound_timestamp,
     parse_timezone,
     validate_glucose_resolution,
+    validate_lookback,
     validate_page_limit,
     validate_summary_bucket,
     validate_time_range,
 )
 from app.schemas.responses import (
+    LAST_MEAL_DERIVED_BASIS,
+    LAST_MEAL_LIMITS_FOUND,
+    LAST_MEAL_LIMITS_MISSING,
+    SNAPSHOT_LIMITS,
+    ContextSnapshotResponse,
     CoverageCategory,
     CoverageMap,
     CoverageResponse,
@@ -51,10 +66,14 @@ from app.schemas.responses import (
     GlucoseSeriesResponse,
     GlucoseSummaryResponse,
     GlucoseSummaryStats,
+    LastLoggedMealResponse,
+    LastMealDerived,
     MealItem,
     MealsResponse,
+    RecentSleepIntervals,
     SleepIntervalItem,
     SleepIntervalsResponse,
+    UnavailableItem,
     WeightMeasurementItem,
     WeightMeasurementsResponse,
     WorkoutItem,
@@ -260,6 +279,61 @@ def _coverage_category(count: Any, first_at: Any, last_at: Any) -> CoverageCateg
     )
 
 
+def _meal_item(row: Any) -> MealItem:
+    return MealItem(
+        id=row.source_sample_id,
+        meal_completed_at=_ensure_aware(row.meal_completed_at),
+        foods=[str(item) for item in (row.foods or [])],
+        source=row.source,
+    )
+
+
+def _workout_item(row: Any) -> WorkoutItem:
+    return WorkoutItem(
+        id=row.source_sample_id,
+        start_time=_ensure_aware(row.start_time),
+        end_time=_ensure_aware(row.end_time),
+        sport=row.sport,
+        distance_meters=_dec(row.distance_meters),
+        duration_minutes=_duration_minutes(row.start_time, row.end_time),
+        source=row.source,
+    )
+
+
+def _weight_item(row: Any) -> WeightMeasurementItem:
+    value_kg = _dec(row.value_kg)
+    if value_kg is None:
+        raise AppError(
+            code="QUERY_FAILED",
+            message="The requested health data could not be retrieved",
+            status_code=500,
+        )
+    return WeightMeasurementItem(
+        id=row.source_sample_id,
+        measured_at=_ensure_aware(row.measured_at),
+        value_kg=value_kg,
+        source=row.source,
+    )
+
+
+def _last_meal_derived(meal: MealItem | None, anchor: datetime) -> LastMealDerived:
+    if meal is None:
+        return LastMealDerived(minutes_since_last_logged_meal=None, basis=None)
+    return LastMealDerived(
+        minutes_since_last_logged_meal=_duration_minutes(meal.meal_completed_at, anchor),
+        basis=LAST_MEAL_DERIVED_BASIS,
+    )
+
+
+def _empty_sleep_aggregate() -> RecentSleepIntervals:
+    return RecentSleepIntervals(
+        record_count=0,
+        first_start_time=None,
+        last_end_time=None,
+        sources=[],
+    )
+
+
 class HealthDataQueryService:
     """Read-only query surface for the personal-primary health dataset."""
 
@@ -412,14 +486,27 @@ class HealthDataQueryService:
         start_utc, end_utc = validate_time_range(start, end)
         tz_name = parse_timezone(timezone)
         user = await self.resolve_personal_user()
+        return CoverageResponse(
+            request_id=request_id,
+            start=start_utc,
+            end=end_utc,
+            timezone=tz_name,
+            coverage=await self._coverage_map(user.id, start_utc, end_utc),
+        )
 
+    async def _coverage_map(
+        self,
+        user_id: uuid.UUID,
+        start_utc: datetime,
+        end_utc: datetime,
+    ) -> CoverageMap:
         glucose_q = select(
             literal("glucose").label("kind"),
             func.count().label("count"),
             func.min(GlucoseSample.sample_time).label("first_at"),
             func.max(GlucoseSample.sample_time).label("last_at"),
         ).where(
-            GlucoseSample.user_id == user.id,
+            GlucoseSample.user_id == user_id,
             GlucoseSample.deleted_at.is_(None),
             GlucoseSample.sample_time >= start_utc,
             GlucoseSample.sample_time < end_utc,
@@ -430,7 +517,7 @@ class HealthDataQueryService:
             func.min(MealEvent.meal_completed_at).label("first_at"),
             func.max(MealEvent.meal_completed_at).label("last_at"),
         ).where(
-            MealEvent.user_id == user.id,
+            MealEvent.user_id == user_id,
             MealEvent.deleted_at.is_(None),
             MealEvent.meal_completed_at >= start_utc,
             MealEvent.meal_completed_at < end_utc,
@@ -442,7 +529,7 @@ class HealthDataQueryService:
             func.min(Workout.start_time).label("first_at"),
             func.max(Workout.start_time).label("last_at"),
         ).where(
-            Workout.user_id == user.id,
+            Workout.user_id == user_id,
             Workout.deleted_at.is_(None),
             Workout.start_time < end_utc,
             Workout.end_time > start_utc,
@@ -453,7 +540,7 @@ class HealthDataQueryService:
             func.min(SleepInterval.start_time).label("first_at"),
             func.max(SleepInterval.start_time).label("last_at"),
         ).where(
-            SleepInterval.user_id == user.id,
+            SleepInterval.user_id == user_id,
             SleepInterval.deleted_at.is_(None),
             SleepInterval.start_time < end_utc,
             SleepInterval.end_time > start_utc,
@@ -464,7 +551,7 @@ class HealthDataQueryService:
             func.min(WeightMeasurement.measured_at).label("first_at"),
             func.max(WeightMeasurement.measured_at).label("last_at"),
         ).where(
-            WeightMeasurement.user_id == user.id,
+            WeightMeasurement.user_id == user_id,
             WeightMeasurement.deleted_at.is_(None),
             WeightMeasurement.measured_at >= start_utc,
             WeightMeasurement.measured_at < end_utc,
@@ -484,18 +571,12 @@ class HealthDataQueryService:
                 return empty
             return _coverage_category(row.count, row.first_at, row.last_at)
 
-        return CoverageResponse(
-            request_id=request_id,
-            start=start_utc,
-            end=end_utc,
-            timezone=tz_name,
-            coverage=CoverageMap(
-                glucose=cat("glucose"),
-                meals=cat("meals"),
-                workouts=cat("workouts"),
-                sleep_intervals=cat("sleep_intervals"),
-                weight_measurements=cat("weight_measurements"),
-            ),
+        return CoverageMap(
+            glucose=cat("glucose"),
+            meals=cat("meals"),
+            workouts=cat("workouts"),
+            sleep_intervals=cat("sleep_intervals"),
+            weight_measurements=cat("weight_measurements"),
         )
 
     async def glucose_series(
@@ -616,12 +697,7 @@ class HealthDataQueryService:
             window=window,
             rows=rows,
             kind="meals",
-            item_builder=lambda row: MealItem(
-                id=row.source_sample_id,
-                meal_completed_at=_ensure_aware(row.meal_completed_at),
-                foods=[str(item) for item in (row.foods or [])],
-                source=row.source,
-            ),
+            item_builder=_meal_item,
             stamp_of_row=lambda row: row.meal_completed_at,
             id_of_row=lambda row: row.source_sample_id,
             fresh_of_items=lambda items: items[-1].meal_completed_at,
@@ -689,15 +765,7 @@ class HealthDataQueryService:
             window=window,
             rows=rows,
             kind="workouts",
-            item_builder=lambda row: WorkoutItem(
-                id=row.source_sample_id,
-                start_time=_ensure_aware(row.start_time),
-                end_time=_ensure_aware(row.end_time),
-                sport=row.sport,
-                distance_meters=_dec(row.distance_meters),
-                duration_minutes=_duration_minutes(row.start_time, row.end_time),
-                source=row.source,
-            ),
+            item_builder=_workout_item,
             stamp_of_row=lambda row: row.start_time,
             id_of_row=lambda row: row.source_sample_id,
             fresh_of_items=_interval_freshness,
@@ -821,21 +889,6 @@ class HealthDataQueryService:
         )
         rows = list((await self.session.execute(stmt)).all())
 
-        def _weight_item(row: Any) -> WeightMeasurementItem:
-            value_kg = _dec(row.value_kg)
-            if value_kg is None:
-                raise AppError(
-                    code="QUERY_FAILED",
-                    message="The requested health data could not be retrieved",
-                    status_code=500,
-                )
-            return WeightMeasurementItem(
-                id=row.source_sample_id,
-                measured_at=_ensure_aware(row.measured_at),
-                value_kg=value_kg,
-                source=row.source,
-            )
-
         return self._paged_response(
             window=window,
             rows=rows,
@@ -846,6 +899,288 @@ class HealthDataQueryService:
             fresh_of_items=lambda items: items[-1].measured_at,
             response_cls=WeightMeasurementsResponse,
         )
+
+    async def last_logged_meal(
+        self,
+        *,
+        request_id: str,
+        anchor: datetime,
+        timezone: str | None,
+        lookback_days: str | int | None,
+    ) -> LastLoggedMealResponse:
+        anchor_utc = parse_bound_timestamp(anchor, field_name="anchor")
+        tz_name = parse_timezone(timezone)
+        resolved_lookback = validate_lookback(
+            lookback_days,
+            default=DEFAULT_MEAL_LOOKBACK_DAYS,
+            max_value=MAX_MEAL_LOOKBACK_DAYS,
+            unit="days",
+            field_name="lookback_days",
+            label="Meal lookback",
+        )
+        user = await self.resolve_personal_user()
+        lookback_start = anchor_utc - timedelta(days=resolved_lookback)
+        meal = await self._select_last_logged_meal(user.id, anchor_utc, lookback_start)
+        found = meal is not None
+        return LastLoggedMealResponse(
+            request_id=request_id,
+            anchor=anchor_utc,
+            timezone=tz_name,
+            lookback_days=resolved_lookback,
+            meal=meal,
+            derived=_last_meal_derived(meal, anchor_utc),
+            limits=list(LAST_MEAL_LIMITS_FOUND if found else LAST_MEAL_LIMITS_MISSING),
+        )
+
+    async def build_context_snapshot(
+        self,
+        *,
+        request_id: str,
+        anchor: datetime,
+        timezone: str | None,
+        meal_lookback_days: str | int | None,
+        sleep_lookback_hours: str | int | None,
+        glucose_lookback_hours: str | int | None,
+    ) -> ContextSnapshotResponse:
+        anchor_utc = parse_bound_timestamp(anchor, field_name="anchor")
+        tz_name = parse_timezone(timezone)
+        resolved_meal_lookback = validate_lookback(
+            meal_lookback_days,
+            default=DEFAULT_MEAL_LOOKBACK_DAYS,
+            max_value=MAX_MEAL_LOOKBACK_DAYS,
+            unit="days",
+            field_name="meal_lookback_days",
+            label="Meal lookback",
+        )
+        resolved_sleep_lookback = validate_lookback(
+            sleep_lookback_hours,
+            default=DEFAULT_SLEEP_LOOKBACK_HOURS,
+            max_value=MAX_SLEEP_LOOKBACK_HOURS,
+            unit="hours",
+            field_name="sleep_lookback_hours",
+            label="Sleep lookback",
+        )
+        resolved_glucose_lookback = validate_lookback(
+            glucose_lookback_hours,
+            default=DEFAULT_GLUCOSE_LOOKBACK_HOURS,
+            max_value=MAX_GLUCOSE_LOOKBACK_HOURS,
+            unit="hours",
+            field_name="glucose_lookback_hours",
+            label="Glucose lookback",
+        )
+        user = await self.resolve_personal_user()
+        user_id = user.id
+
+        meal_start = anchor_utc - timedelta(days=resolved_meal_lookback)
+        workout_start = anchor_utc - timedelta(days=SNAPSHOT_WORKOUT_LOOKBACK_DAYS)
+        sleep_start = anchor_utc - timedelta(hours=resolved_sleep_lookback)
+        weight_start = anchor_utc - timedelta(days=SNAPSHOT_WEIGHT_LOOKBACK_DAYS)
+        glucose_start = anchor_utc - timedelta(hours=resolved_glucose_lookback)
+
+        meal = await self._select_last_logged_meal(user_id, anchor_utc, meal_start)
+        workout = await self._select_latest_completed_workout(
+            user_id, anchor_utc, workout_start
+        )
+        sleep = await self._select_recent_sleep_aggregate(user_id, sleep_start, anchor_utc)
+        weight = await self._select_latest_weight(user_id, anchor_utc, weight_start)
+        glucose_coverage = await self._glucose_coverage(user_id, glucose_start, anchor_utc)
+        glucose_summary = await self._glucose_overall_summary(
+            user_id, glucose_start, anchor_utc
+        )
+
+        unavailable: list[UnavailableItem] = []
+        if meal is None:
+            unavailable.append(
+                UnavailableItem(
+                    category="last_logged_meal", reason="no_record_in_lookback"
+                )
+            )
+        if workout is None:
+            unavailable.append(
+                UnavailableItem(
+                    category="most_recent_workout", reason="no_record_in_lookback"
+                )
+            )
+        if sleep.record_count == 0:
+            unavailable.append(
+                UnavailableItem(
+                    category="recent_sleep_intervals", reason="no_record_in_lookback"
+                )
+            )
+        if weight is None:
+            unavailable.append(
+                UnavailableItem(
+                    category="most_recent_weight_measurement",
+                    reason="no_record_in_lookback",
+                )
+            )
+        if glucose_coverage.count == 0:
+            unavailable.append(
+                UnavailableItem(
+                    category="glucose_coverage", reason="no_samples_in_window"
+                )
+            )
+        if glucose_summary.sample_count == 0:
+            unavailable.append(
+                UnavailableItem(
+                    category="glucose_summary", reason="no_samples_in_window"
+                )
+            )
+
+        return ContextSnapshotResponse(
+            request_id=request_id,
+            anchor=anchor_utc,
+            timezone=tz_name,
+            meal_lookback_days=resolved_meal_lookback,
+            sleep_lookback_hours=resolved_sleep_lookback,
+            glucose_lookback_hours=resolved_glucose_lookback,
+            last_logged_meal=meal,
+            most_recent_workout=workout,
+            recent_sleep_intervals=sleep,
+            most_recent_weight_measurement=weight,
+            glucose_coverage=glucose_coverage,
+            glucose_summary=glucose_summary,
+            derived=_last_meal_derived(meal, anchor_utc),
+            unavailable=unavailable,
+            limits=list(SNAPSHOT_LIMITS),
+        )
+
+    async def _select_last_logged_meal(
+        self,
+        user_id: uuid.UUID,
+        anchor: datetime,
+        lookback_start: datetime,
+    ) -> MealItem | None:
+        stmt = (
+            select(
+                MealEvent.source_sample_id,
+                MealEvent.meal_completed_at,
+                MealEvent.foods,
+                MealEvent.source,
+            )
+            .where(
+                MealEvent.user_id == user_id,
+                MealEvent.deleted_at.is_(None),
+                MealEvent.meal_completed_at <= anchor,
+                MealEvent.meal_completed_at >= lookback_start,
+            )
+            .order_by(
+                MealEvent.meal_completed_at.desc(),
+                MealEvent.source_sample_id.desc(),
+            )
+            .limit(1)
+        )
+        row = (await self.session.execute(stmt)).first()
+        return _meal_item(row) if row is not None else None
+
+    async def _select_latest_completed_workout(
+        self,
+        user_id: uuid.UUID,
+        anchor: datetime,
+        lookback_start: datetime,
+    ) -> WorkoutItem | None:
+        stmt = (
+            select(
+                Workout.source_sample_id,
+                Workout.start_time,
+                Workout.end_time,
+                Workout.sport,
+                Workout.distance_meters,
+                Workout.source,
+            )
+            .where(
+                Workout.user_id == user_id,
+                Workout.deleted_at.is_(None),
+                Workout.end_time <= anchor,
+                Workout.end_time >= lookback_start,
+            )
+            .order_by(Workout.end_time.desc(), Workout.source_sample_id.desc())
+            .limit(1)
+        )
+        row = (await self.session.execute(stmt)).first()
+        return _workout_item(row) if row is not None else None
+
+    async def _glucose_coverage(
+        self,
+        user_id: uuid.UUID,
+        start_utc: datetime,
+        end_utc: datetime,
+    ) -> CoverageCategory:
+        row = (
+            await self.session.execute(
+                select(
+                    func.count().label("count"),
+                    func.min(GlucoseSample.sample_time).label("first_at"),
+                    func.max(GlucoseSample.sample_time).label("last_at"),
+                ).where(
+                    GlucoseSample.user_id == user_id,
+                    GlucoseSample.deleted_at.is_(None),
+                    GlucoseSample.sample_time >= start_utc,
+                    GlucoseSample.sample_time < end_utc,
+                )
+            )
+        ).one()
+        return _coverage_category(row.count, row.first_at, row.last_at)
+
+    async def _select_recent_sleep_aggregate(
+        self,
+        user_id: uuid.UUID,
+        window_start: datetime,
+        anchor: datetime,
+    ) -> RecentSleepIntervals:
+        row = (
+            await self.session.execute(
+                select(
+                    func.count().label("record_count"),
+                    func.min(SleepInterval.start_time).label("first_start_time"),
+                    func.max(SleepInterval.end_time).label("last_end_time"),
+                    func.array_agg(distinct(SleepInterval.source)).label("sources"),
+                ).where(
+                    SleepInterval.user_id == user_id,
+                    SleepInterval.deleted_at.is_(None),
+                    SleepInterval.start_time < anchor,
+                    SleepInterval.end_time > window_start,
+                )
+            )
+        ).one()
+        count = int(row.record_count or 0)
+        if count == 0:
+            return _empty_sleep_aggregate()
+        sources = sorted({str(source) for source in (row.sources or []) if source is not None})
+        return RecentSleepIntervals(
+            record_count=count,
+            first_start_time=_ensure_aware(row.first_start_time),
+            last_end_time=_ensure_aware(row.last_end_time),
+            sources=sources,
+        )
+
+    async def _select_latest_weight(
+        self,
+        user_id: uuid.UUID,
+        anchor: datetime,
+        lookback_start: datetime,
+    ) -> WeightMeasurementItem | None:
+        stmt = (
+            select(
+                WeightMeasurement.source_sample_id,
+                WeightMeasurement.measured_at,
+                WeightMeasurement.value_kg,
+                WeightMeasurement.source,
+            )
+            .where(
+                WeightMeasurement.user_id == user_id,
+                WeightMeasurement.deleted_at.is_(None),
+                WeightMeasurement.measured_at <= anchor,
+                WeightMeasurement.measured_at >= lookback_start,
+            )
+            .order_by(
+                WeightMeasurement.measured_at.desc(),
+                WeightMeasurement.source_sample_id.desc(),
+            )
+            .limit(1)
+        )
+        row = (await self.session.execute(stmt)).first()
+        return _weight_item(row) if row is not None else None
 
     async def _glucose_raw(
         self,

@@ -14,26 +14,37 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request
 
 from app.api.dependencies import DbSession
 from app.core import (
+    DEFAULT_GLUCOSE_LOOKBACK_HOURS,
+    DEFAULT_MEAL_LOOKBACK_DAYS,
     DEFAULT_PAGE_LIMIT,
     DEFAULT_QUERY_TIMEZONE,
+    DEFAULT_SLEEP_LOOKBACK_HOURS,
+    MAX_GLUCOSE_LOOKBACK_HOURS,
+    MAX_MEAL_LOOKBACK_DAYS,
     MAX_PAGE_LIMIT,
+    MAX_SLEEP_LOOKBACK_HOURS,
     MAX_SLEEP_RANGE_DAYS,
     MAX_WEIGHT_RANGE_DAYS,
     MAX_WORKOUT_RANGE_DAYS,
+    SNAPSHOT_WEIGHT_LOOKBACK_DAYS,
+    SNAPSHOT_WORKOUT_LOOKBACK_DAYS,
 )
 from app.core.errors import AppError, ErrorResponse
 from app.core.security import require_read_auth
 from app.schemas.responses import (
+    ContextSnapshotResponse,
     CoverageResponse,
     GlucoseSeriesResponse,
     GlucoseSummaryResponse,
+    LastLoggedMealResponse,
     MealsResponse,
     PagedResponse,
     SleepIntervalsResponse,
@@ -68,7 +79,7 @@ _ERROR_RESPONSES = {
     },
     422: {
         "model": ErrorResponse,
-        "description": "Invalid time range, timezone, resolution, cursor, limit, or result size",
+        "description": "Invalid time range, timezone, resolution, cursor, limit, lookback, or result size",
         "content": {
             "application/json": {
                 "examples": {
@@ -89,6 +100,16 @@ _ERROR_RESPONSES = {
                                 "code": "RANGE_TOO_LARGE",
                                 "message": "Raw glucose queries are limited to 7 days",
                                 "details": {"max_days": 7},
+                            },
+                            "request_id": "00000000-0000-0000-0000-000000000001",
+                        },
+                    },
+                    "invalid_lookback": {
+                        "summary": "Lookback is not a positive integer",
+                        "value": {
+                            "error": {
+                                "code": "INVALID_LOOKBACK",
+                                "message": "lookback_days must be a positive integer",
                             },
                             "request_id": "00000000-0000-0000-0000-000000000001",
                         },
@@ -138,40 +159,83 @@ def _qp(request: Request, name: str) -> str | None:
     return value if value else None
 
 
+@dataclass
+class QueryLogMeta:
+    start: str | datetime | None = None
+    end: str | datetime | None = None
+    timezone: str | None = None
+    resolution: str | None = None
+    bucket: str | None = None
+    record_count: int | None = None
+    truncated: bool | None = None
+    anchor: str | datetime | None = None
+    lookback_days: int | str | None = None
+    meal_lookback_days: int | str | None = None
+    sleep_lookback_hours: int | str | None = None
+    glucose_lookback_hours: int | str | None = None
+
+
+def _fmt_ts(value: str | datetime | None) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _error_log_meta(request: Request) -> QueryLogMeta:
+    return QueryLogMeta(
+        start=_qp(request, "start"),
+        end=_qp(request, "end"),
+        timezone=_qp(request, "timezone"),
+        resolution=_qp(request, "resolution"),
+        bucket=_qp(request, "bucket"),
+        anchor=_qp(request, "anchor"),
+        lookback_days=_qp(request, "lookback_days"),
+        meal_lookback_days=_qp(request, "meal_lookback_days"),
+        sleep_lookback_hours=_qp(request, "sleep_lookback_hours"),
+        glucose_lookback_hours=_qp(request, "glucose_lookback_hours"),
+    )
+
+
 def _log_query(
     *,
     request: Request,
     route: str,
     status: int,
-    start: str | datetime | None,
-    end: str | datetime | None,
-    timezone: str | None,
-    resolution: str | None = None,
-    bucket: str | None = None,
-    record_count: int | None = None,
-    truncated: bool | None = None,
+    meta: QueryLogMeta,
     latency_ms: float,
     error_code: str | None = None,
 ) -> None:
-    start_s = start.isoformat() if isinstance(start, datetime) else start
-    end_s = end.isoformat() if isinstance(end, datetime) else end
+    extras: list[str] = []
+    anchor_s = _fmt_ts(meta.anchor)
+    if anchor_s is not None:
+        extras.append(f"anchor={anchor_s}")
+    if meta.lookback_days is not None:
+        extras.append(f"lookback_days={meta.lookback_days}")
+    if meta.meal_lookback_days is not None:
+        extras.append(f"meal_lookback_days={meta.meal_lookback_days}")
+    if meta.sleep_lookback_hours is not None:
+        extras.append(f"sleep_lookback_hours={meta.sleep_lookback_hours}")
+    if meta.glucose_lookback_hours is not None:
+        extras.append(f"glucose_lookback_hours={meta.glucose_lookback_hours}")
+    extra_s = (" " + " ".join(extras)) if extras else ""
     logger.info(
         "query_access request_id=%s route=%s status=%s principal=%s "
         "start=%s end=%s timezone=%s resolution=%s bucket=%s "
-        "record_count=%s truncated=%s latency_ms=%.1f error_code=%s",
+        "record_count=%s truncated=%s latency_ms=%.1f error_code=%s%s",
         _request_id(request),
         route,
         status,
         getattr(request.state, "auth_role", "read"),
-        start_s,
-        end_s,
-        timezone,
-        resolution,
-        bucket,
-        record_count,
-        truncated,
+        _fmt_ts(meta.start),
+        _fmt_ts(meta.end),
+        meta.timezone,
+        meta.resolution,
+        meta.bucket,
+        meta.record_count,
+        meta.truncated,
         latency_ms,
         error_code,
+        extra_s,
     )
 
 
@@ -180,27 +244,17 @@ async def _execute[T](
     route: str,
     coro: Awaitable[T],
     *,
-    on_success: Callable[
-        [T],
-        tuple[datetime, datetime, str, int | None, bool | None, str | None, str | None],
-    ],
+    on_success: Callable[[T], QueryLogMeta],
 ) -> T:
     started = time.perf_counter()
     try:
         result = await coro
         latency_ms = (time.perf_counter() - started) * 1000
-        start, end, timezone, record_count, truncated, resolution, bucket = on_success(result)
         _log_query(
             request=request,
             route=route,
             status=200,
-            start=start,
-            end=end,
-            timezone=timezone,
-            resolution=resolution,
-            bucket=bucket,
-            record_count=record_count,
-            truncated=truncated,
+            meta=on_success(result),
             latency_ms=latency_ms,
         )
         return result
@@ -210,11 +264,7 @@ async def _execute[T](
             request=request,
             route=route,
             status=exc.status_code,
-            start=_qp(request, "start"),
-            end=_qp(request, "end"),
-            timezone=_qp(request, "timezone"),
-            resolution=_qp(request, "resolution"),
-            bucket=_qp(request, "bucket"),
+            meta=_error_log_meta(request),
             latency_ms=latency_ms,
             error_code=exc.code,
         )
@@ -255,17 +305,13 @@ ListCursor = Annotated[
 ]
 
 
-def _paged_success(
-    result: PagedResponse[object],
-) -> tuple[datetime, datetime, str, int | None, bool | None, str | None, str | None]:
-    return (
-        result.start,
-        result.end,
-        result.timezone,
-        result.record_count,
-        result.truncated,
-        None,
-        None,
+def _paged_success(result: PagedResponse[object]) -> QueryLogMeta:
+    return QueryLogMeta(
+        start=result.start,
+        end=result.end,
+        timezone=result.timezone,
+        record_count=result.record_count,
+        truncated=result.truncated,
     )
 
 
@@ -318,7 +364,7 @@ async def get_coverage(
             end=end,
             timezone=timezone,
         ),
-        on_success=lambda r: (r.start, r.end, r.timezone, None, None, None, None),
+        on_success=lambda r: QueryLogMeta(start=r.start, end=r.end, timezone=r.timezone),
     )
 
 
@@ -402,14 +448,13 @@ async def get_glucose_series(
             resolution=resolution,
             timezone=timezone,
         ),
-        on_success=lambda r: (
-            r.start,
-            r.end,
-            r.timezone,
-            r.returned_point_count,
-            r.truncated,
-            r.resolution,
-            None,
+        on_success=lambda r: QueryLogMeta(
+            start=r.start,
+            end=r.end,
+            timezone=r.timezone,
+            record_count=r.returned_point_count,
+            truncated=r.truncated,
+            resolution=r.resolution,
         ),
     )
 
@@ -456,7 +501,13 @@ async def get_glucose_summary(
             count = sum(day.sample_count for day in r.days)
         else:
             count = 0
-        return r.start, r.end, r.timezone, count, None, None, r.bucket
+        return QueryLogMeta(
+            start=r.start,
+            end=r.end,
+            timezone=r.timezone,
+            record_count=count,
+            bucket=r.bucket,
+        )
 
     return await _execute(
         request,
@@ -661,4 +712,166 @@ async def get_weight_measurements(
             limit=limit,
             cursor=cursor,
         ),
+    )
+
+
+@router.get(
+    "/last-logged-meal",
+    response_model=LastLoggedMealResponse,
+    summary="Latest logged meal at or before an anchor",
+    description=(
+        "Read-only latest logged meal at or before a required timezone-aware `anchor`. "
+        "Foods are included. Meal notes are excluded. "
+        "Optional `lookback_days` defaults to "
+        f"{DEFAULT_MEAL_LOOKBACK_DAYS} and is capped at {MAX_MEAL_LOOKBACK_DAYS}. "
+        "Selection is `meal_completed_at <= anchor` and "
+        "`meal_completed_at >= anchor - lookback_days` (elapsed duration, not "
+        "civil-calendar arithmetic), ordered by `meal_completed_at` descending then "
+        "`source_sample_id` descending.\n\n"
+        "`minutes_since_last_logged_meal` is based only on the latest logged meal. "
+        "It does not confirm fasting or account for unlogged food or caloric intake. "
+        "Absence of a meal returns HTTP 200 with `meal: null`; it does not 404. "
+        "This endpoint reports recorded data and transparent calculations only; "
+        "it does not provide medical advice or clinical interpretation."
+    ),
+    responses=_ERROR_RESPONSES,
+    response_model_exclude_none=False,
+)
+async def get_last_logged_meal(
+    request: Request,
+    db: DbSession,
+    anchor: Annotated[
+        datetime,
+        Query(description="Timezone-aware ISO-8601 timestamp (latest meal at or before this instant)"),
+    ],
+    timezone: Annotated[
+        str,
+        Query(description=f"IANA timezone (default {DEFAULT_QUERY_TIMEZONE})"),
+    ] = DEFAULT_QUERY_TIMEZONE,
+    lookback_days: Annotated[
+        int | None,
+        Query(
+            description=(
+                "Positive integer lookback in elapsed days "
+                f"(default {DEFAULT_MEAL_LOOKBACK_DAYS}, max {MAX_MEAL_LOOKBACK_DAYS})"
+            ),
+        ),
+    ] = None,
+) -> LastLoggedMealResponse:
+    service = HealthDataQueryService(db)
+
+    def _success(result: LastLoggedMealResponse) -> QueryLogMeta:
+        lookback_start = result.anchor - timedelta(days=result.lookback_days)
+        return QueryLogMeta(
+            start=lookback_start,
+            end=result.anchor,
+            timezone=result.timezone,
+            record_count=0 if result.meal is None else 1,
+            anchor=result.anchor,
+            lookback_days=result.lookback_days,
+        )
+
+    return await _execute(
+        request,
+        "/v1/query/last-logged-meal",
+        service.last_logged_meal(
+            request_id=_request_id(request),
+            anchor=anchor,
+            timezone=timezone,
+            lookback_days=lookback_days,
+        ),
+        on_success=_success,
+    )
+
+
+@router.get(
+    "/context-snapshot",
+    response_model=ContextSnapshotResponse,
+    summary="Bounded evidence-only context around an anchor",
+    description=(
+        "Read-only bounded context snapshot around a required timezone-aware `anchor`. "
+        "Includes the latest logged meal (foods included, notes excluded), the most "
+        "recent completed workout "
+        f"(end_time at or before anchor, {SNAPSHOT_WORKOUT_LOOKBACK_DAYS}-day lookback), "
+        "a compact raw sleep-interval aggregate (overlap with the sleep lookback; "
+        "not a sleep session, not stage values, not a quality assessment), "
+        f"the most recent weight measurement ({SNAPSHOT_WEIGHT_LOOKBACK_DAYS}-day lookback), "
+        "glucose coverage, and a descriptive overall glucose summary. "
+        "It does not return a glucose series.\n\n"
+        f"`meal_lookback_days` default {DEFAULT_MEAL_LOOKBACK_DAYS}, max {MAX_MEAL_LOOKBACK_DAYS}. "
+        f"`sleep_lookback_hours` default {DEFAULT_SLEEP_LOOKBACK_HOURS}, max {MAX_SLEEP_LOOKBACK_HOURS}. "
+        f"`glucose_lookback_hours` default {DEFAULT_GLUCOSE_LOOKBACK_HOURS}, max {MAX_GLUCOSE_LOOKBACK_HOURS}. "
+        "Lookbacks are elapsed durations, not civil-calendar arithmetic.\n\n"
+        "Time since last logged meal does not confirm fasting. "
+        "A partial snapshot is always HTTP 200 with `unavailable` entries. "
+        "This endpoint reports recorded data and transparent calculations only; "
+        "it does not diagnose, infer symptoms or causality, assess safety or "
+        "readiness, or provide medical advice or clinical interpretation."
+    ),
+    responses=_ERROR_RESPONSES,
+    response_model_exclude_none=False,
+)
+async def get_context_snapshot(
+    request: Request,
+    db: DbSession,
+    anchor: Annotated[
+        datetime,
+        Query(description="Timezone-aware ISO-8601 timestamp anchoring the snapshot"),
+    ],
+    timezone: Annotated[
+        str,
+        Query(description=f"IANA timezone (default {DEFAULT_QUERY_TIMEZONE})"),
+    ] = DEFAULT_QUERY_TIMEZONE,
+    meal_lookback_days: Annotated[
+        int | None,
+        Query(
+            description=(
+                "Positive integer meal lookback in elapsed days "
+                f"(default {DEFAULT_MEAL_LOOKBACK_DAYS}, max {MAX_MEAL_LOOKBACK_DAYS})"
+            ),
+        ),
+    ] = None,
+    sleep_lookback_hours: Annotated[
+        int | None,
+        Query(
+            description=(
+                "Positive integer sleep lookback in elapsed hours "
+                f"(default {DEFAULT_SLEEP_LOOKBACK_HOURS}, max {MAX_SLEEP_LOOKBACK_HOURS})"
+            ),
+        ),
+    ] = None,
+    glucose_lookback_hours: Annotated[
+        int | None,
+        Query(
+            description=(
+                "Positive integer glucose lookback in elapsed hours "
+                f"(default {DEFAULT_GLUCOSE_LOOKBACK_HOURS}, max {MAX_GLUCOSE_LOOKBACK_HOURS})"
+            ),
+        ),
+    ] = None,
+) -> ContextSnapshotResponse:
+    service = HealthDataQueryService(db)
+
+    def _success(result: ContextSnapshotResponse) -> QueryLogMeta:
+        return QueryLogMeta(
+            timezone=result.timezone,
+            record_count=result.recent_sleep_intervals.record_count,
+            anchor=result.anchor,
+            meal_lookback_days=result.meal_lookback_days,
+            sleep_lookback_hours=result.sleep_lookback_hours,
+            glucose_lookback_hours=result.glucose_lookback_hours,
+        )
+
+    return await _execute(
+        request,
+        "/v1/query/context-snapshot",
+        service.build_context_snapshot(
+            request_id=_request_id(request),
+            anchor=anchor,
+            timezone=timezone,
+            meal_lookback_days=meal_lookback_days,
+            sleep_lookback_hours=sleep_lookback_hours,
+            glucose_lookback_hours=glucose_lookback_hours,
+        ),
+        on_success=_success,
     )

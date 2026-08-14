@@ -85,6 +85,11 @@ def log_request(
     truncated: bool | None = None,
     latency_ms: float | None = None,
     error_code: str | None = None,
+    anchor: str | None = None,
+    lookback_days: int | None = None,
+    meal_lookback_days: int | None = None,
+    sleep_lookback_hours: int | None = None,
+    glucose_lookback_hours: int | None = None,
 ) -> None:
     parts = [
         f"request_id={request_id}",
@@ -109,4 +114,17 @@ def log_request(
             f"error_code={error_code}",
         ]
     )
+    extras: list[str] = []
+    if anchor is not None:
+        extras.append(f"anchor={anchor}")
+    if lookback_days is not None:
+        extras.append(f"lookback_days={lookback_days}")
+    if meal_lookback_days is not None:
+        extras.append(f"meal_lookback_days={meal_lookback_days}")
+    if sleep_lookback_hours is not None:
+        extras.append(f"sleep_lookback_hours={sleep_lookback_hours}")
+    if glucose_lookback_hours is not None:
+        extras.append(f"glucose_lookback_hours={glucose_lookback_hours}")
+    if extras:
+        parts.extend(extras)
     logger.info("mcp_access %s", " ".join(parts))
