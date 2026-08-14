@@ -638,6 +638,11 @@ class HealthDataQueryService:
         limit: int | None,
         cursor: str | None,
     ) -> WorkoutsResponse:
+        # Canonical rows are whatever survived ingest: source_name must be
+        # "Strava" or the record is rejected (UNSUPPORTED_WORKOUT_SOURCE).
+        # There is no query-time overlap collapse against Apple Health copies.
+        # Public `source` is the stored provenance column (typically apple_health).
+        #
         # Overlap uses end_time. There is no ix_workouts_user_id_end_time in M1.
         # After deploy, inspect EXPLAIN (ANALYZE, BUFFERS) on this query (and
         # coverage) before adding that index.

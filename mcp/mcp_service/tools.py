@@ -77,11 +77,13 @@ MEALS_DESCRIPTION = (
 )
 
 WORKOUTS_DESCRIPTION = (
-    "Return raw workout intervals that overlap an explicit [start, end) window "
-    "(start_time < end AND end_time > start). "
+    "Return ingest-accepted (Strava) workout intervals that overlap an explicit "
+    "[start, end) window (start_time < end AND end_time > start). "
+    "Native Apple Health duplicates are rejected at ingest and are not listed. "
     f"Maximum window: {MAX_WORKOUT_RANGE_DAYS} days. "
     "Timestamps are original stored UTC instants and are not clipped. "
     "Fields: id, start_time, end_time, sport, distance_meters, duration_minutes, source. "
+    "source is the stored provenance value (typically apple_health). "
     "Heart rate, active energy, pace, elevation, metadata, and source_name are excluded. "
     "Do not give medical advice, diagnosis, training-load, readiness, or clinical interpretation. "
     "Use returned next_cursor to fetch later pages only when necessary."

@@ -1049,6 +1049,7 @@ def _workout(
     start: str,
     end: str,
     *,
+    source_name: str = "Strava",
     distance: float | None = 5000,
     kcal: float | None = 310,
     avg_hr: float | None = 148,
@@ -1057,7 +1058,7 @@ def _workout(
     return {
         "source": "apple_health",
         "source_sample_id": sample_id,
-        "source_name": "Strava",
+        "source_name": source_name,
         "start_time": start,
         "end_time": end,
         "sport": "running",
@@ -1065,7 +1066,7 @@ def _workout(
         "active_energy_kcal": kcal,
         "average_heart_rate": avg_hr,
         "maximum_heart_rate": max_hr,
-        "metadata": {"source_app": "Strava", "secret": "do-not-leak"},
+        "metadata": {"source_app": source_name, "secret": "do-not-leak"},
     }
 
 
@@ -1321,6 +1322,64 @@ async def test_workout_sensitive_fields_absent_from_seed(
     assert "310" not in resp.text
     assert "148" not in resp.text
     assert "172" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_overlapping_apple_health_run_is_not_listed_when_strava_exists(
+    client: AsyncClient,
+    ingest_headers: dict,
+    read_headers: dict,
+):
+    strava_id = "strava-canonical-run"
+    apple_id = "apple-health-duplicate-run"
+    ingest = await client.post(
+        "/v1/ingest/batch",
+        headers=ingest_headers,
+        json=_export_body(
+            workouts=[
+                _workout(
+                    apple_id,
+                    "2026-08-05T12:05:00.000Z",
+                    "2026-08-05T12:55:00.000Z",
+                    source_name="Apple Watch",
+                    distance=1111,
+                ),
+                _workout(
+                    strava_id,
+                    "2026-08-05T12:00:00.000Z",
+                    "2026-08-05T13:00:00.000Z",
+                    distance=5000,
+                ),
+            ]
+        ),
+    )
+    assert ingest.status_code == 200
+    workouts_summary = ingest.json()["summary"]["workouts"]
+    assert workouts_summary["received"] == 2
+    assert workouts_summary["inserted"] == 1
+    assert workouts_summary["rejected"] == 1
+    assert any(
+        r["code"] == "UNSUPPORTED_WORKOUT_SOURCE" and r["source_sample_id"] == apple_id
+        for r in ingest.json()["rejections"]
+    )
+
+    window = _q(start="2026-08-05T12:00:00Z", end="2026-08-05T13:00:00Z")
+    listed = await client.get("/v1/query/workouts?" + window, headers=read_headers)
+    assert listed.status_code == 200
+    body = listed.json()
+    assert body["record_count"] == 1
+    item = body["items"][0]
+    assert item["id"] == strava_id
+    assert item["source"] == "apple_health"
+    assert item["distance_meters"] == 5000
+    assert "source_name" not in item
+    assert apple_id not in listed.text
+    assert "Apple Watch" not in listed.text
+    assert "1111" not in listed.text
+
+    coverage = await client.get("/v1/query/coverage?" + window, headers=read_headers)
+    assert coverage.status_code == 200
+    assert coverage.json()["coverage"]["workouts"]["count"] == 1
 
 
 @pytest.mark.asyncio

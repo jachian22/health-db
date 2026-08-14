@@ -543,9 +543,12 @@ async def get_meals(
     response_model=WorkoutsResponse,
     summary="Workout intervals overlapping a bounded window",
     description=(
-        "Read-only workout list. Included when the interval overlaps "
-        "`[start, end)`: `start_time < end AND end_time > start`. "
+        "Read-only workout list of ingest-accepted (Strava) records. "
+        "Native Apple Health duplicates are rejected at ingest and are not "
+        "listed. Included when the interval overlaps `[start, end)`: "
+        "`start_time < end AND end_time > start`. "
         "Returned timestamps are unclipped stored UTC instants. "
+        "`source` is the stored provenance value (typically `apple_health`). "
         f"Maximum window: {MAX_WORKOUT_RANGE_DAYS} days. "
         "Public `id` is `source_sample_id`. `duration_minutes` is derived; "
         "`distance_meters` may be null. Heart rate, energy, and metadata are "
