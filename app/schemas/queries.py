@@ -123,6 +123,22 @@ def enforce_max_range_days(
         )
 
 
+def enforce_max_range_hours(
+    start: datetime,
+    end: datetime,
+    *,
+    max_hours: int,
+    label: str,
+) -> None:
+    if end - start > timedelta(hours=max_hours):
+        raise AppError(
+            code="RANGE_TOO_LARGE",
+            message=f"{label} queries are limited to {max_hours} hours",
+            status_code=422,
+            details={"max_hours": max_hours},
+        )
+
+
 LOOKBACK_QUERY_FIELDS = frozenset(
     {
         "lookback_days",

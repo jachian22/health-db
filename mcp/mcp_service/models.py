@@ -216,6 +216,30 @@ class ContextSnapshotResponse(QueryModel):
     limits: list[str]
 
 
+class TimelineGlucoseSeries(QueryModel):
+    aggregation: Literal["mean_min_max"]
+    source_record_count: int
+    returned_point_count: int
+    truncated: bool = False
+    data_fresh_through: datetime | None = None
+    points: list[GlucoseBucketPoint] = Field(default_factory=list)
+
+
+class PersonalTimelineResponse(QueryModel):
+    request_id: str
+    start: datetime
+    end: datetime
+    timezone: str
+    glucose_resolution: Literal["15m"]
+    meals: list[MealItem] = Field(default_factory=list)
+    workouts: list[WorkoutItem] = Field(default_factory=list)
+    sleep_intervals: list[SleepIntervalItem] = Field(default_factory=list)
+    weight_measurements: list[WeightMeasurementItem] = Field(default_factory=list)
+    glucose: TimelineGlucoseSeries
+    coverage: CoverageMap
+    limits: list[str]
+
+
 def to_iso8601(value: datetime) -> str:
     text = value.isoformat()
     if text.endswith("+00:00"):
@@ -280,6 +304,21 @@ def enforce_max_range_days(
             code="RANGE_TOO_LARGE",
             message=f"{label} queries are limited to {max_days} days",
             max_days=max_days,
+        )
+
+
+def enforce_max_range_hours(
+    start: datetime,
+    end: datetime,
+    *,
+    max_hours: int,
+    label: str,
+) -> None:
+    if end - start > timedelta(hours=max_hours):
+        raise ToolError(
+            code="RANGE_TOO_LARGE",
+            message=f"{label} queries are limited to {max_hours} hours",
+            max_hours=max_hours,
         )
 
 
@@ -361,4 +400,14 @@ def coverage_record_count(result: CoverageResponse) -> int:
         + coverage.workouts.count
         + coverage.sleep_intervals.count
         + coverage.weight_measurements.count
+    )
+
+
+def timeline_record_count(result: PersonalTimelineResponse) -> int:
+    """Sum of the four event arrays; excludes glucose points."""
+    return (
+        len(result.meals)
+        + len(result.workouts)
+        + len(result.sleep_intervals)
+        + len(result.weight_measurements)
     )

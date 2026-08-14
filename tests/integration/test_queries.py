@@ -25,11 +25,17 @@ def _q(**params: str) -> str:
 # --- Authentication ---
 
 
+WINDOWED_AUTH_PATHS = (
+    "/v1/query/coverage",
+    "/v1/query/personal-timeline",
+)
+
+
 @pytest.mark.asyncio
-async def test_query_missing_auth_returns_401(client: AsyncClient):
+@pytest.mark.parametrize("path", WINDOWED_AUTH_PATHS)
+async def test_query_missing_auth_returns_401(client: AsyncClient, path: str):
     resp = await client.get(
-        "/v1/query/coverage?"
-        + _q(start="2026-08-01T00:00:00Z", end="2026-08-02T00:00:00Z")
+        path + "?" + _q(start="2026-08-01T00:00:00Z", end="2026-08-02T00:00:00Z")
     )
     assert resp.status_code == 401
     assert resp.json()["error"]["code"] == "UNAUTHORIZED"
@@ -37,10 +43,10 @@ async def test_query_missing_auth_returns_401(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_query_invalid_read_key_returns_401(client: AsyncClient):
+@pytest.mark.parametrize("path", WINDOWED_AUTH_PATHS)
+async def test_query_invalid_read_key_returns_401(client: AsyncClient, path: str):
     resp = await client.get(
-        "/v1/query/coverage?"
-        + _q(start="2026-08-01T00:00:00Z", end="2026-08-02T00:00:00Z"),
+        path + "?" + _q(start="2026-08-01T00:00:00Z", end="2026-08-02T00:00:00Z"),
         headers={"Authorization": "Bearer wrong-key"},
     )
     assert resp.status_code == 401
@@ -65,13 +71,14 @@ async def test_query_valid_read_key_succeeds(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", WINDOWED_AUTH_PATHS)
 async def test_ingest_key_rejected_by_query_api(
     client: AsyncClient,
     ingest_headers: dict,
+    path: str,
 ):
     resp = await client.get(
-        "/v1/query/coverage?"
-        + _q(start="2026-08-01T00:00:00Z", end="2026-08-02T00:00:00Z"),
+        path + "?" + _q(start="2026-08-01T00:00:00Z", end="2026-08-02T00:00:00Z"),
         headers=ingest_headers,
     )
     assert resp.status_code == 401
@@ -964,6 +971,7 @@ async def test_query_endpoints_get_only(client: AsyncClient, read_headers: dict)
         "/v1/query/weight-measurements",
         "/v1/query/last-logged-meal",
         "/v1/query/context-snapshot",
+        "/v1/query/personal-timeline",
     ):
         suffix = (
             _q(anchor="2026-08-15T14:00:00Z")
@@ -2286,3 +2294,565 @@ async def test_snapshot_query_failed_sanitized(client: AsyncClient, read_headers
     assert resp.json()["error"]["code"] == "QUERY_FAILED"
     assert "postgresql" not in resp.text.lower()
     assert "secret" not in resp.text
+
+
+# --- M3: personal timeline ---
+
+
+TIMELINE_PATH = "/v1/query/personal-timeline"
+TIMELINE_START = "2026-08-10T04:00:00Z"
+TIMELINE_END = "2026-08-13T04:00:00Z"
+M3_FOOD = "SECRET_M3_FOOD_xyz"
+M3_STAGE = "SECRET_M3_STAGE_xyz"
+M3_WEIGHT = 77.125
+M3_GLUCOSE = 141.5
+M3_SENSITIVE_KEYS = (
+    "notes",
+    "metadata",
+    "user_id",
+    "source_name",
+    "ingested_at",
+    "updated_at",
+    "deleted_at",
+    "health_source_id",
+    "average_heart_rate",
+    "maximum_heart_rate",
+    "active_energy_kcal",
+    "next_cursor",
+    "record_count",
+    "unavailable",
+    "quality",
+    "session",
+    "readiness",
+)
+
+
+def _timeline_url(**params: str) -> str:
+    query = {"start": TIMELINE_START, "end": TIMELINE_END, **params}
+    return TIMELINE_PATH + "?" + _q(**query)
+
+
+def _assert_no_envelope_pagination(body: dict) -> None:
+    assert "next_cursor" not in body
+    assert "truncated" not in body
+    assert "record_count" not in body
+    assert "data_fresh_through" not in body
+
+
+@pytest.mark.asyncio
+async def test_timeline_naive_timestamps_rejected(
+    client: AsyncClient, read_headers: dict
+):
+    resp = await client.get(
+        TIMELINE_PATH
+        + "?"
+        + _q(start="2026-08-10T04:00:00", end="2026-08-13T04:00:00Z"),
+        headers=read_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "INVALID_TIME_RANGE"
+
+
+@pytest.mark.asyncio
+async def test_timeline_invalid_timezone_rejected(
+    client: AsyncClient, read_headers: dict
+):
+    resp = await client.get(
+        _timeline_url(timezone="Not/A_Zone"), headers=read_headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "INVALID_TIMEZONE"
+
+
+@pytest.mark.asyncio
+async def test_timeline_end_not_after_start_rejected(
+    client: AsyncClient, read_headers: dict
+):
+    resp = await client.get(
+        TIMELINE_PATH
+        + "?"
+        + _q(start="2026-08-13T04:00:00Z", end="2026-08-10T04:00:00Z"),
+        headers=read_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "INVALID_TIME_RANGE"
+
+
+@pytest.mark.asyncio
+async def test_timeline_exact_72_hours_succeeds(
+    client: AsyncClient, read_headers: dict
+):
+    resp = await client.get(_timeline_url(), headers=read_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["start"].startswith("2026-08-10T04:00:00")
+    assert body["end"].startswith("2026-08-13T04:00:00")
+    assert body["timezone"] == "America/New_York"
+    assert body["glucose_resolution"] == "15m"
+
+
+@pytest.mark.asyncio
+async def test_timeline_72_hours_plus_one_second_rejected(
+    client: AsyncClient, read_headers: dict
+):
+    resp = await client.get(
+        TIMELINE_PATH
+        + "?"
+        + _q(start="2026-08-10T04:00:00Z", end="2026-08-13T04:00:01Z"),
+        headers=read_headers,
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"]["code"] == "RANGE_TOO_LARGE"
+    assert body["error"]["details"] == {"max_hours": 72}
+
+
+@pytest.mark.asyncio
+async def test_timeline_range_uses_elapsed_hours_not_civil_days(
+    client: AsyncClient, read_headers: dict
+):
+    # US Eastern fall-back 2026-11-01: three civil days is 73 elapsed hours.
+    too_big = await client.get(
+        TIMELINE_PATH
+        + "?"
+        + _q(start="2026-10-31T12:00:00-04:00", end="2026-11-03T12:00:00-05:00"),
+        headers=read_headers,
+    )
+    assert too_big.status_code == 422
+    assert too_big.json()["error"]["code"] == "RANGE_TOO_LARGE"
+    assert too_big.json()["error"]["details"]["max_hours"] == 72
+
+    exact = await client.get(
+        TIMELINE_PATH
+        + "?"
+        + _q(start="2026-10-31T12:00:00-04:00", end="2026-11-03T11:00:00-05:00"),
+        headers=read_headers,
+    )
+    assert exact.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_timeline_selection_boundaries_ordering_and_public_fields(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            meal_events=[
+                _meal("meal-at-start", "2026-08-10T04:00:00.000Z", foods=[M3_FOOD]),
+                _meal("meal-at-end", "2026-08-13T04:00:00.000Z", foods=["excluded"]),
+                _meal("meal-z", "2026-08-11T12:00:00.000Z", foods=["z"]),
+                _meal("meal-a", "2026-08-11T12:00:00.000Z", foods=["a"]),
+            ],
+            workouts=[
+                _workout(
+                    "wo-overlap",
+                    "2026-08-10T02:00:00.000Z",
+                    "2026-08-10T06:00:00.000Z",
+                ),
+                _workout(
+                    "wo-end-at-start",
+                    "2026-08-10T02:00:00.000Z",
+                    "2026-08-10T04:00:00.000Z",
+                ),
+                _workout(
+                    "wo-start-at-end",
+                    "2026-08-13T04:00:00.000Z",
+                    "2026-08-13T06:00:00.000Z",
+                ),
+            ],
+            sleep_sessions=[
+                _sleep(
+                    "sl-overlap",
+                    "2026-08-10T03:00:00.000Z",
+                    "2026-08-10T05:00:00.000Z",
+                    M3_STAGE,
+                ),
+                _sleep(
+                    "sl-adjacent-a",
+                    "2026-08-11T01:00:00.000Z",
+                    "2026-08-11T02:00:00.000Z",
+                    "core",
+                ),
+                _sleep(
+                    "sl-adjacent-b",
+                    "2026-08-11T02:00:00.000Z",
+                    "2026-08-11T03:00:00.000Z",
+                    "deep",
+                ),
+                _sleep(
+                    "sl-end-at-start",
+                    "2026-08-10T02:00:00.000Z",
+                    "2026-08-10T04:00:00.000Z",
+                    "awake",
+                ),
+                _sleep(
+                    "sl-start-at-end",
+                    "2026-08-13T04:00:00.000Z",
+                    "2026-08-13T06:00:00.000Z",
+                    "rem",
+                ),
+            ],
+            weight_measurements=[
+                _weight("wt-at-start", "2026-08-10T04:00:00.000Z", M3_WEIGHT),
+                _weight("wt-at-end", "2026-08-13T04:00:00.000Z", 80.0),
+                _weight("wt-z", "2026-08-11T08:00:00.000Z", 70.0),
+                _weight("wt-a", "2026-08-11T08:00:00.000Z", 71.0),
+            ],
+        ),
+    )
+    resp = await client.get(_timeline_url(), headers=read_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_no_envelope_pagination(body)
+
+    assert [item["id"] for item in body["meals"]] == [
+        "meal-at-start",
+        "meal-a",
+        "meal-z",
+    ]
+    assert body["meals"][0]["foods"] == [M3_FOOD]
+    assert "notes" not in body["meals"][0]
+    assert "metadata" not in body["meals"][0]
+    assert "secret-note" not in resp.text
+
+    assert [item["id"] for item in body["workouts"]] == ["wo-overlap"]
+    overlap = body["workouts"][0]
+    assert overlap["start_time"].startswith("2026-08-10T02:00:00")
+    assert overlap["end_time"].startswith("2026-08-10T06:00:00")
+    for key in (
+        "average_heart_rate",
+        "maximum_heart_rate",
+        "active_energy_kcal",
+        "metadata",
+        "source_name",
+        "user_id",
+        "health_source_id",
+    ):
+        assert key not in overlap
+    assert "148" not in resp.text
+    assert "310" not in resp.text
+
+    assert [item["id"] for item in body["sleep_intervals"]] == [
+        "sl-overlap",
+        "sl-adjacent-a",
+        "sl-adjacent-b",
+    ]
+    assert body["sleep_intervals"][0]["stage"] == M3_STAGE
+    assert body["sleep_intervals"][0]["start_time"].startswith("2026-08-10T03:00:00")
+    assert body["sleep_intervals"][0]["end_time"].startswith("2026-08-10T05:00:00")
+    assert body["sleep_intervals"][1]["id"] != body["sleep_intervals"][2]["id"]
+    for item in body["sleep_intervals"]:
+        assert "quality" not in item
+        assert "session" not in item
+        assert "readiness" not in item
+
+    assert [item["id"] for item in body["weight_measurements"]] == [
+        "wt-at-start",
+        "wt-a",
+        "wt-z",
+    ]
+    assert body["weight_measurements"][0]["value_kg"] == M3_WEIGHT
+    assert "unit" not in body["weight_measurements"][0]
+    assert "value_lb" not in body["weight_measurements"][0]
+
+    for key in M3_SENSITIVE_KEYS:
+        assert key not in body
+    assert "user_id" not in resp.text
+    assert "ingested_at" not in resp.text
+    assert "deleted_at" not in resp.text
+
+    cov = body["coverage"]
+    assert set(cov) == {
+        "glucose",
+        "meals",
+        "workouts",
+        "sleep_intervals",
+        "weight_measurements",
+    }
+    assert cov["meals"]["count"] == len(body["meals"])
+    assert cov["workouts"]["count"] == len(body["workouts"])
+    assert cov["sleep_intervals"]["count"] == len(body["sleep_intervals"])
+    assert cov["weight_measurements"]["count"] == len(body["weight_measurements"])
+    assert cov["glucose"]["count"] == 0
+    assert cov["glucose"]["first_at"] is None
+    assert cov["glucose"]["last_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_timeline_glucose_matches_15m_aggregation_and_empty_shape(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    empty = await client.get(_timeline_url(), headers=read_headers)
+    assert empty.status_code == 200
+    empty_body = empty.json()
+    assert empty_body["meals"] == []
+    assert empty_body["workouts"] == []
+    assert empty_body["sleep_intervals"] == []
+    assert empty_body["weight_measurements"] == []
+    assert empty_body["glucose_resolution"] == "15m"
+    glucose = empty_body["glucose"]
+    assert glucose == {
+        "aggregation": "mean_min_max",
+        "source_record_count": 0,
+        "returned_point_count": 0,
+        "truncated": False,
+        "data_fresh_through": None,
+        "points": [],
+    }
+    assert "resolution" not in glucose
+    assert "request_id" not in glucose
+    assert "start" not in glucose
+    assert "end" not in glucose
+    assert "timezone" not in glucose
+    _assert_no_envelope_pagination(empty_body)
+    for cat in empty_body["coverage"].values():
+        assert cat == {"count": 0, "first_at": None, "last_at": None}
+    limits = " ".join(empty_body["limits"]).lower()
+    assert "read-only" in limits
+    assert "notes" in limits
+    assert "raw" in limits and "sleep" in limits
+    assert "15-minute" in limits
+    assert "medical advice" in limits
+
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            glucose_samples=[
+                _glucose("g1", "2026-08-11T14:16:00Z", 90),
+                _glucose("g2", "2026-08-11T14:18:00Z", 100),
+                _glucose("g3", "2026-08-11T14:22:00Z", 110),
+                _glucose("g4", "2026-08-11T15:05:00Z", M3_GLUCOSE),
+            ]
+        ),
+    )
+    window = _q(start="2026-08-11T14:00:00Z", end="2026-08-11T16:00:00Z")
+    series = await client.get(
+        "/v1/query/glucose/series?" + window + "&resolution=15m",
+        headers=read_headers,
+    )
+    timeline = await client.get(
+        TIMELINE_PATH + "?" + window, headers=read_headers
+    )
+    assert series.status_code == 200
+    assert timeline.status_code == 200
+    tbody = timeline.json()
+    sbody = series.json()
+    assert tbody["glucose_resolution"] == "15m"
+    assert tbody["glucose"]["aggregation"] == "mean_min_max"
+    assert tbody["glucose"]["truncated"] is False
+    assert tbody["glucose"]["source_record_count"] == sbody["source_record_count"]
+    assert tbody["glucose"]["returned_point_count"] == sbody["returned_point_count"]
+    assert tbody["glucose"]["points"] == sbody["points"]
+    assert tbody["glucose"]["data_fresh_through"] == sbody["data_fresh_through"]
+    assert "resolution" not in tbody["glucose"]
+    for point in tbody["glucose"]["points"]:
+        assert set(point) == {
+            "start",
+            "end",
+            "mean_mg_dl",
+            "min_mg_dl",
+            "max_mg_dl",
+            "sample_count",
+        }
+        assert "timestamp" not in point
+        assert "value_mg_dl" not in point
+
+
+@pytest.mark.asyncio
+async def test_timeline_sleep_more_than_public_page_limit(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    base = datetime(2026, 8, 11, 0, 0, tzinfo=UTC)
+    intervals = []
+    for i in range(101):
+        start = base + timedelta(minutes=i * 2)
+        end = start + timedelta(minutes=1)
+        intervals.append(
+            _sleep(
+                f"sl-many-{i:03d}",
+                start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                end.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                "core",
+            )
+        )
+    await _seed(client, ingest_headers, _export_body(sleep_sessions=intervals))
+    resp = await client.get(_timeline_url(), headers=read_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["sleep_intervals"]) == 101
+    assert body["coverage"]["sleep_intervals"]["count"] == 101
+    _assert_no_envelope_pagination(body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("category", "seed_kwargs"),
+    [
+        (
+            "sleep_intervals",
+            {
+                "sleep_sessions": [
+                    _sleep(
+                        f"sl-cap-{i}",
+                        f"2026-08-11T0{i}:00:00.000Z",
+                        f"2026-08-11T0{i}:30:00.000Z",
+                        "core",
+                    )
+                    for i in range(3)
+                ]
+            },
+        ),
+        (
+            "meals",
+            {
+                "meal_events": [
+                    _meal(f"meal-cap-{i}", f"2026-08-11T0{i}:00:00.000Z")
+                    for i in range(3)
+                ]
+            },
+        ),
+        (
+            "workouts",
+            {
+                "workouts": [
+                    _workout(
+                        f"wo-cap-{i}",
+                        f"2026-08-11T0{i}:00:00.000Z",
+                        f"2026-08-11T0{i}:30:00.000Z",
+                    )
+                    for i in range(3)
+                ]
+            },
+        ),
+        (
+            "weight_measurements",
+            {
+                "weight_measurements": [
+                    _weight(f"wt-cap-{i}", f"2026-08-11T0{i}:00:00.000Z", 70.0 + i)
+                    for i in range(3)
+                ]
+            },
+        ),
+    ],
+)
+async def test_timeline_event_cap_fails_whole_request(
+    client: AsyncClient,
+    ingest_headers: dict,
+    read_headers: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    category: str,
+    seed_kwargs: dict,
+):
+    monkeypatch.setattr(
+        "app.services.query_service.MAX_TIMELINE_ITEMS_PER_CATEGORY", 2
+    )
+    await _seed(client, ingest_headers, _export_body(**seed_kwargs))
+    resp = await client.get(_timeline_url(), headers=read_headers)
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"]["code"] == "RESULT_TOO_LARGE"
+    assert body["error"]["details"] == {"max_items": 2, "category": category}
+    assert "meals" not in body
+    assert "glucose" not in body
+    assert "coverage" not in body
+    assert "max_points" not in (body["error"].get("details") or {})
+
+
+@pytest.mark.asyncio
+async def test_timeline_logs_safe_metadata_and_sanitized_failure(
+    client: AsyncClient, ingest_headers: dict, read_headers: dict
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            meal_events=[
+                _meal("meal-m3-log", "2026-08-11T12:00:00.000Z", foods=[M3_FOOD])
+            ],
+            workouts=[
+                _workout(
+                    "wo-m3-log",
+                    "2026-08-11T06:00:00.000Z",
+                    "2026-08-11T06:32:00.000Z",
+                )
+            ],
+            sleep_sessions=[
+                _sleep(
+                    "sl-m3-log",
+                    "2026-08-11T01:00:00.000Z",
+                    "2026-08-11T02:00:00.000Z",
+                    M3_STAGE,
+                )
+            ],
+            weight_measurements=[
+                _weight("wt-m3-log", "2026-08-11T08:00:00.000Z", M3_WEIGHT)
+            ],
+            glucose_samples=[
+                _glucose("g-m3-log", "2026-08-11T14:16:00Z", M3_GLUCOSE)
+            ],
+        ),
+    )
+    records: list[str] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record.getMessage())
+
+    handler = _ListHandler()
+    handler.setLevel(logging.INFO)
+    query_logger.addHandler(handler)
+    previous_level = query_logger.level
+    previous_disabled = query_logger.disabled
+    query_logger.setLevel(logging.INFO)
+    query_logger.disabled = False
+    try:
+        resp = await client.get(_timeline_url(), headers=read_headers)
+    finally:
+        query_logger.removeHandler(handler)
+        query_logger.setLevel(previous_level)
+        query_logger.disabled = previous_disabled
+    assert resp.status_code == 200
+    log_text = "\n".join(records)
+    assert "query_access" in log_text
+    assert "route=/v1/query/personal-timeline" in log_text
+    assert "start=" in log_text
+    assert "end=" in log_text
+    assert "timezone=" in log_text
+    assert "resolution=15m" in log_text
+    # Four event arrays only; glucose buckets are not included in record_count.
+    assert "record_count=4" in log_text
+    assert "truncated=False" in log_text
+    assert "latency_ms=" in log_text
+    assert M3_FOOD not in log_text
+    assert M3_STAGE not in log_text
+    assert "meal-m3-log" not in log_text
+    assert "wo-m3-log" not in log_text
+    assert "sl-m3-log" not in log_text
+    assert "wt-m3-log" not in log_text
+    assert str(M3_WEIGHT) not in log_text
+    assert str(M3_GLUCOSE) not in log_text
+    assert "average_heart_rate" not in log_text
+    assert "active_energy_kcal" not in log_text
+    assert "secret-note" not in log_text
+    assert "Authorization" not in log_text
+    assert "test-read-key" not in log_text
+
+    with patch(
+        "app.services.query_service.HealthDataQueryService.resolve_personal_user",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError(
+            "connection to postgresql://secret@db SELECT * FROM meals failed"
+        ),
+    ):
+        failed = await client.get(_timeline_url(), headers=read_headers)
+    assert failed.status_code == 500
+    body = failed.json()
+    assert body["error"]["code"] == "QUERY_FAILED"
+    assert "postgresql" not in failed.text.lower()
+    assert "secret" not in failed.text
+    assert "SELECT" not in failed.text
+    assert "RuntimeError" not in failed.text
+    assert "stack" not in failed.text.lower()

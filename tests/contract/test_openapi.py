@@ -23,6 +23,7 @@ async def test_openapi_documents_query_api_v1(client: AsyncClient):
     assert "/v1/query/weight-measurements" in paths
     assert "/v1/query/last-logged-meal" in paths
     assert "/v1/query/context-snapshot" in paths
+    assert "/v1/query/personal-timeline" in paths
     assert "/health" in paths
     assert "/ready" in paths
 
@@ -92,6 +93,26 @@ async def test_openapi_documents_query_api_v1(client: AsyncClient):
     assert "raw" in snapshot_desc and "sleep" in snapshot_desc
     assert "glucose series" in snapshot_desc
     assert "medical advice" in snapshot_desc or "interpretation" in snapshot_desc
+
+    timeline = paths["/v1/query/personal-timeline"]["get"]
+    assert "get" in paths["/v1/query/personal-timeline"]
+    assert "post" not in paths["/v1/query/personal-timeline"]
+    timeline_desc = timeline["description"].lower()
+    assert "read-only" in timeline_desc
+    assert "72" in timeline["description"]
+    assert "[start, end)" in timeline["description"]
+    assert "15-minute" in timeline_desc or "15 minute" in timeline_desc
+    assert "foods" in timeline_desc
+    assert "notes" in timeline_desc
+    assert "raw" in timeline_desc and "sleep" in timeline_desc
+    assert "session" in timeline_desc
+    assert "medical advice" in timeline_desc or "interpretation" in timeline_desc
+    param_names = {param["name"] for param in timeline.get("parameters", [])}
+    assert param_names == {"start", "end", "timezone"}
+    assert "resolution" not in param_names
+    assert "limit" not in param_names
+    assert "cursor" not in param_names
+    assert "bucket" not in param_names
 
     # Error schema exists
     schemas = spec["components"]["schemas"]

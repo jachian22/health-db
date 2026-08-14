@@ -1,12 +1,14 @@
 """GET /v1/query/* — authenticated read-only health data Query API v1.
 
 All endpoints require Authorization: Bearer <READ_API_KEY>, explicit bounded
-time ranges, and return UTC source timestamps. Timezone is used only for
-local-calendar aggregation/labels (default America/New_York).
+time ranges, and return UTC source timestamps. Timezone is response metadata
+(default America/New_York). Glucose daily summary is the exception: it uses
+timezone for local-calendar grouping.
 
 Resource protection is application-level only: hard date-range limits, list page
-size, glucose point ceilings, and Postgres statement_timeout on read queries.
-There is no in-process rate limiter; rely on those caps (and platform limits).
+size, glucose point ceilings, timeline item caps, and Postgres statement_timeout
+on read queries. There is no in-process rate limiter; rely on those caps (and
+platform limits).
 """
 
 from __future__ import annotations
@@ -32,6 +34,8 @@ from app.core import (
     MAX_PAGE_LIMIT,
     MAX_SLEEP_LOOKBACK_HOURS,
     MAX_SLEEP_RANGE_DAYS,
+    MAX_TIMELINE_ITEMS_PER_CATEGORY,
+    MAX_TIMELINE_RANGE_HOURS,
     MAX_WEIGHT_RANGE_DAYS,
     MAX_WORKOUT_RANGE_DAYS,
     SNAPSHOT_WEIGHT_LOOKBACK_DAYS,
@@ -47,6 +51,7 @@ from app.schemas.responses import (
     LastLoggedMealResponse,
     MealsResponse,
     PagedResponse,
+    PersonalTimelineResponse,
     SleepIntervalsResponse,
     WeightMeasurementsResponse,
     WorkoutsResponse,
@@ -161,6 +166,14 @@ def _qp(request: Request, name: str) -> str | None:
 
 @dataclass
 class QueryLogMeta:
+    """Safe query-access log fields. Never log health values or identifiers.
+
+    ``record_count`` is endpoint-specific: list pages use item count, glucose
+    series uses returned points, and personal-timeline uses the sum of the four
+    event arrays (meals, workouts, sleep_intervals, weight_measurements), not
+    glucose bucket count.
+    """
+
     start: str | datetime | None = None
     end: str | datetime | None = None
     timezone: str | None = None
@@ -312,6 +325,16 @@ def _paged_success(result: PagedResponse[object]) -> QueryLogMeta:
         timezone=result.timezone,
         record_count=result.record_count,
         truncated=result.truncated,
+    )
+
+
+def _timeline_event_count(result: PersonalTimelineResponse) -> int:
+    """Sum of the four event arrays; excludes glucose points."""
+    return (
+        len(result.meals)
+        + len(result.workouts)
+        + len(result.sleep_intervals)
+        + len(result.weight_measurements)
     )
 
 
@@ -872,6 +895,66 @@ async def get_context_snapshot(
             meal_lookback_days=meal_lookback_days,
             sleep_lookback_hours=sleep_lookback_hours,
             glucose_lookback_hours=glucose_lookback_hours,
+        ),
+        on_success=_success,
+    )
+
+
+@router.get(
+    "/personal-timeline",
+    response_model=PersonalTimelineResponse,
+    summary="Bounded visualization-ready historical timeline",
+    description=(
+        "Read-only historical timeline for an explicit half-open `[start, end)` window "
+        f"(maximum {MAX_TIMELINE_RANGE_HOURS} elapsed hours). "
+        "Returns meals with foods (notes excluded), workouts, raw sleep intervals "
+        "(not sessionized), weight measurements, a fixed 15-minute mean/min/max "
+        "glucose series, and category-level coverage. "
+        "Glucose resolution is fixed at 15 minutes and is not client-selectable. "
+        "Event arrays are not paginated; more than "
+        f"{MAX_TIMELINE_ITEMS_PER_CATEGORY} matching records in any "
+        "event category returns `RESULT_TOO_LARGE`. "
+        "This endpoint reports recorded data only; it does not diagnose, infer "
+        "causes or symptoms, assess safety, or provide medical advice or "
+        "clinical interpretation."
+    ),
+    responses=_ERROR_RESPONSES,
+    response_model_exclude_none=False,
+)
+async def get_personal_timeline(
+    request: Request,
+    db: DbSession,
+    start: Annotated[
+        datetime, Query(description="Inclusive range start (ISO-8601 with timezone)")
+    ],
+    end: Annotated[
+        datetime, Query(description="Exclusive range end (ISO-8601 with timezone)")
+    ],
+    timezone: Annotated[
+        str,
+        Query(description=f"IANA timezone (default {DEFAULT_QUERY_TIMEZONE})"),
+    ] = DEFAULT_QUERY_TIMEZONE,
+) -> PersonalTimelineResponse:
+    service = HealthDataQueryService(db)
+
+    def _success(result: PersonalTimelineResponse) -> QueryLogMeta:
+        return QueryLogMeta(
+            start=result.start,
+            end=result.end,
+            timezone=result.timezone,
+            resolution=result.glucose_resolution,
+            record_count=_timeline_event_count(result),
+            truncated=False,
+        )
+
+    return await _execute(
+        request,
+        "/v1/query/personal-timeline",
+        service.personal_timeline(
+            request_id=_request_id(request),
+            start=start,
+            end=end,
+            timezone=timezone,
         ),
         on_success=_success,
     )

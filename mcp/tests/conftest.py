@@ -26,6 +26,7 @@ from mcp_service.models import (  # noqa: E402
     CoverageCategory,
     CoverageMap,
     CoverageResponse,
+    GlucoseBucketPoint,
     GlucoseRawPoint,
     GlucoseSeriesResponse,
     GlucoseSummaryResponse,
@@ -34,9 +35,11 @@ from mcp_service.models import (  # noqa: E402
     LastMealDerived,
     MealItem,
     MealsResponse,
+    PersonalTimelineResponse,
     RecentSleepIntervals,
     SleepIntervalItem,
     SleepIntervalsResponse,
+    TimelineGlucoseSeries,
     WeightMeasurementItem,
     WeightMeasurementsResponse,
     WorkoutItem,
@@ -59,6 +62,8 @@ UNIQUE_WEIGHT_ID = "weight-sample-UNIQUE-id"
 START = datetime(2026, 8, 1, tzinfo=UTC)
 END = datetime(2026, 8, 12, tzinfo=UTC)
 ANCHOR = datetime(2026, 8, 15, 14, 0, tzinfo=UTC)
+TIMELINE_START = datetime(2026, 8, 10, 4, 0, tzinfo=UTC)
+TIMELINE_END = datetime(2026, 8, 13, 4, 0, tzinfo=UTC)
 
 LAST_MEAL_LIMITS_FOUND = [
     "Based only on the latest logged meal at or before the anchor time.",
@@ -77,6 +82,14 @@ SNAPSHOT_LIMITS = [
     "It does not confirm fasting or account for unlogged food or caloric intake.",
     "Sleep entries are raw synced intervals, not a sleep session or sleep-quality assessment.",
     "This response reports recorded data and transparent calculations only; it does not diagnose, explain symptoms, assess safety, or provide medical advice.",
+]
+
+TIMELINE_LIMITS = [
+    "The response is read-only historical data.",
+    "Meals may include logged foods; notes are excluded.",
+    "Sleep entries are raw synced intervals, not sleep sessions or a sleep-quality assessment.",
+    "The glucose series is aggregated at 15-minute resolution.",
+    "The timeline reports records only and does not provide diagnosis, causal explanations, safety assessment, or medical advice.",
 ]
 
 
@@ -355,6 +368,98 @@ def default_context_snapshot() -> ContextSnapshotResponse:
     )
 
 
+def default_personal_timeline() -> PersonalTimelineResponse:
+    return PersonalTimelineResponse(
+        request_id="query-req-10",
+        start=TIMELINE_START,
+        end=TIMELINE_END,
+        timezone="America/New_York",
+        glucose_resolution="15m",
+        meals=[
+            MealItem(
+                id=UNIQUE_SOURCE_ID,
+                meal_completed_at=datetime(2026, 8, 11, 19, 42, tzinfo=UTC),
+                foods=[UNIQUE_FOOD],
+                source="manual",
+            )
+        ],
+        workouts=[
+            WorkoutItem(
+                id=UNIQUE_WORKOUT_ID,
+                start_time=datetime(2026, 8, 11, 6, 0, tzinfo=UTC),
+                end_time=datetime(2026, 8, 11, 6, 32, tzinfo=UTC),
+                sport="running",
+                distance_meters=5200.0,
+                duration_minutes=32.0,
+                source="apple_health",
+            )
+        ],
+        sleep_intervals=[
+            SleepIntervalItem(
+                id=UNIQUE_SLEEP_ID,
+                start_time=datetime(2026, 8, 11, 1, 0, tzinfo=UTC),
+                end_time=datetime(2026, 8, 11, 2, 0, tzinfo=UTC),
+                duration_minutes=60.0,
+                stage=UNIQUE_STAGE,
+                source="apple_health",
+            )
+        ],
+        weight_measurements=[
+            WeightMeasurementItem(
+                id=UNIQUE_WEIGHT_ID,
+                measured_at=datetime(2026, 8, 11, 8, 0, tzinfo=UTC),
+                value_kg=UNIQUE_KG,
+                source="apple_health",
+            )
+        ],
+        glucose=TimelineGlucoseSeries(
+            aggregation="mean_min_max",
+            source_record_count=1,
+            returned_point_count=1,
+            truncated=False,
+            data_fresh_through=datetime(2026, 8, 11, 14, 30, tzinfo=UTC),
+            points=[
+                GlucoseBucketPoint(
+                    start=datetime(2026, 8, 11, 14, 15, tzinfo=UTC),
+                    end=datetime(2026, 8, 11, 14, 30, tzinfo=UTC),
+                    mean_mg_dl=UNIQUE_GLUCOSE,
+                    min_mg_dl=UNIQUE_GLUCOSE,
+                    max_mg_dl=UNIQUE_GLUCOSE,
+                    sample_count=1,
+                )
+            ],
+        ),
+        coverage=CoverageMap(
+            glucose=CoverageCategory(
+                count=1,
+                first_at=datetime(2026, 8, 11, 14, 16, tzinfo=UTC),
+                last_at=datetime(2026, 8, 11, 14, 16, tzinfo=UTC),
+            ),
+            meals=CoverageCategory(
+                count=1,
+                first_at=datetime(2026, 8, 11, 19, 42, tzinfo=UTC),
+                last_at=datetime(2026, 8, 11, 19, 42, tzinfo=UTC),
+            ),
+            workouts=CoverageCategory(
+                count=1,
+                first_at=datetime(2026, 8, 11, 6, 0, tzinfo=UTC),
+                last_at=datetime(2026, 8, 11, 6, 0, tzinfo=UTC),
+            ),
+            sleep_intervals=CoverageCategory(
+                count=1,
+                first_at=datetime(2026, 8, 11, 1, 0, tzinfo=UTC),
+                last_at=datetime(2026, 8, 11, 1, 0, tzinfo=UTC),
+            ),
+            weight_measurements=CoverageCategory(
+                count=1,
+                first_at=datetime(2026, 8, 11, 8, 0, tzinfo=UTC),
+                last_at=datetime(2026, 8, 11, 8, 0, tzinfo=UTC),
+            ),
+        ),
+        limits=TIMELINE_LIMITS,
+    )
+
+
 @dataclass
 class FakeQueryClient:
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
@@ -369,6 +474,7 @@ class FakeQueryClient:
     )
     last_logged_meal: LastLoggedMealResponse = field(default_factory=default_last_logged_meal)
     context_snapshot: ContextSnapshotResponse = field(default_factory=default_context_snapshot)
+    personal_timeline: PersonalTimelineResponse = field(default_factory=default_personal_timeline)
     ready_ok: bool = True
     error: Exception | None = None
     closed: bool = False
@@ -433,6 +539,12 @@ class FakeQueryClient:
         if self.error:
             raise self.error
         return self.context_snapshot
+
+    async def get_personal_timeline(self, **kwargs: Any) -> PersonalTimelineResponse:
+        self.calls.append(("personal_timeline", kwargs))
+        if self.error:
+            raise self.error
+        return self.personal_timeline
 
 
 @pytest.fixture

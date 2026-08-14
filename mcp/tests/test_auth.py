@@ -100,7 +100,7 @@ def test_correct_key_allows_mcp_protocol_handling(
     assert TEST_MCP_KEY not in resp.text
 
 
-def test_authenticated_http_lists_nine_tools(client: TestClient, mcp_headers: dict[str, str]):
+def test_authenticated_http_lists_ten_tools(client: TestClient, mcp_headers: dict[str, str]):
     headers = {
         **mcp_headers,
         "Accept": "application/json, text/event-stream",
@@ -141,6 +141,7 @@ def test_authenticated_http_lists_nine_tools(client: TestClient, mcp_headers: di
         "get_weight_measurements",
         "get_last_logged_meal",
         "build_context_snapshot",
+        "get_personal_timeline",
     ]
 
 

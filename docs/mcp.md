@@ -91,7 +91,7 @@ Missing required settings fail fast at process start. Secret values are never pr
 
 ## Tools
 
-Nine read-only tools. Each maps to one Query API route.
+Ten read-only tools. Each maps to one Query API route.
 
 | MCP tool | Query API | Purpose |
 |---|---|---|
@@ -104,6 +104,7 @@ Nine read-only tools. Each maps to one Query API route.
 | `get_weight_measurements` | `GET /v1/query/weight-measurements` | Weight measurements in `[start, end)` |
 | `get_last_logged_meal` | `GET /v1/query/last-logged-meal` | Latest logged meal at or before an anchor |
 | `build_context_snapshot` | `GET /v1/query/context-snapshot` | Bounded evidence-only context around an anchor |
+| `get_personal_timeline` | `GET /v1/query/personal-timeline` | Bounded historical timeline for replay (max 72 elapsed hours) |
 
 Typical agent workflow:
 
@@ -115,6 +116,12 @@ For “what was last eaten / what is around now”:
 
 ```text
 get_last_logged_meal or build_context_snapshot (timezone-aware anchor)
+```
+
+For a bounded historical replay window, prefer `get_personal_timeline` rather than combining category tools:
+
+```text
+get_personal_timeline (timezone-aware [start, end), maximum 72 elapsed hours)
 ```
 
 Shared list inputs: timezone-aware ISO-8601 `start` / `end` (half-open `[start, end)`). Optional `timezone` defaults to `America/New_York`. List tools accept `limit` (default 100, max 500) and an opaque `cursor`.
@@ -145,6 +152,23 @@ Returns one envelope (no fake universal `start` / `end`):
 
 Missing resources stay HTTP 200. `unavailable` uses `no_record_in_lookback` (meal/workout/sleep/weight) or `no_samples_in_window` (empty glucose coverage **and** summary). Time since last logged meal does not confirm fasting. No diagnosis, symptoms, safety, readiness, or medical advice.
 
+### `get_personal_timeline`
+
+Inputs: timezone-aware `start` / `end` (required, half-open `[start, end)`), optional `timezone` (default `America/New_York`). No `limit`, `cursor`, glucose `resolution`, `bucket`, user ID, anchor, or lookbacks.
+
+Maximum window: **72 elapsed hours** (`end - start` after UTC normalization; exact 72 hours is valid). Larger windows return `RANGE_TOO_LARGE` with `max_hours: 72`.
+
+Returns one envelope:
+
+- Meals with foods (notes excluded)
+- Workouts (overlap inclusion; timestamps unclipped)
+- Raw sleep intervals (overlap inclusion; not sessionized, not quality-scored)
+- Weight measurements (`value_kg`)
+- Fixed **15-minute** mean/min/max glucose series (resolution is not client-selectable; no raw glucose)
+- Category coverage for the same requested window (not derived from the returned arrays)
+
+Event arrays are **not paginated**. More than **2000** matching records in any event category fails the whole request with `RESULT_TOO_LARGE` (`max_items` + `category`). No partial event results. Historical/evidence-only; no medical advice or interpretation.
+
 ### Tool input limits
 
 These are enforced in the MCP service for actionable errors. The Query API still validates independently.
@@ -169,6 +193,9 @@ These are enforced in the MCP service for actionable errors. The Query API still
 | `glucose_lookback_hours` | integer 1–48 (default 24); elapsed hours |
 | Snapshot workout lookback | fixed 14 elapsed days; completed workouts only (`end_time <= anchor`) |
 | Snapshot weight lookback | fixed 30 elapsed days |
+| Personal timeline window | maximum 72 elapsed hours; exact 72 hours is valid |
+| Personal timeline events | no pagination; more than 2000 items per category → `RESULT_TOO_LARGE` |
+| Personal timeline glucose | fixed 15-minute mean/min/max; not client-selectable |
 
 Invalid lookbacks (`<= 0` or non-integer) return `INVALID_LOOKBACK`. Values above the max return `RANGE_TOO_LARGE`.
 
@@ -288,7 +315,7 @@ curl -i -X POST https://YOUR-MCP-RAILWAY-DOMAIN/mcp \
   -H "Content-Type: application/json" --data '{}'
 ```
 
-Then use an MCP client/inspector with the real `MCP_API_KEY` against `https://YOUR-MCP-RAILWAY-DOMAIN/mcp` to list tools and call all nine. Confirm Railway logs show request IDs, tool names, and latency — not health values, foods, notes, sleep stages, weight kilograms, secrets, or raw payloads.
+Then use an MCP client/inspector with the real `MCP_API_KEY` against `https://YOUR-MCP-RAILWAY-DOMAIN/mcp` to list tools and call all ten. Confirm Railway logs show request IDs, tool names, and latency — not health values, foods, notes, sleep stages, weight kilograms, secrets, or raw payloads.
 
 ## Cursor configuration
 
@@ -331,6 +358,7 @@ get_sleep_intervals
 get_weight_measurements
 get_last_logged_meal
 build_context_snapshot
+get_personal_timeline
 ```
 
 Bounded smoke workflow (describe available data only; do not make medical claims):

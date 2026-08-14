@@ -15,6 +15,7 @@ from mcp_service.tools import (
     GLUCOSE_SUMMARY_DESCRIPTION,
     LAST_LOGGED_MEAL_DESCRIPTION,
     MEALS_DESCRIPTION,
+    PERSONAL_TIMELINE_DESCRIPTION,
     SLEEP_INTERVALS_DESCRIPTION,
     WEIGHT_MEASUREMENTS_DESCRIPTION,
     WORKOUTS_DESCRIPTION,
@@ -43,7 +44,7 @@ def _error_payload(result) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_lists_exactly_nine_tools(mcp_server):
+async def test_lists_exactly_ten_tools(mcp_server):
     async with Client(mcp_server) as client:
         listed = await client.list_tools()
     names = [tool.name for tool in listed.tools]
@@ -57,6 +58,7 @@ async def test_lists_exactly_nine_tools(mcp_server):
         "get_weight_measurements",
         "get_last_logged_meal",
         "build_context_snapshot",
+        "get_personal_timeline",
     ]
     by_name = {tool.name: tool for tool in listed.tools}
     assert "Call this first when exploring an unfamiliar date range" in by_name[
@@ -71,6 +73,14 @@ async def test_lists_exactly_nine_tools(mcp_server):
     assert by_name["get_weight_measurements"].description == WEIGHT_MEASUREMENTS_DESCRIPTION
     assert by_name["get_last_logged_meal"].description == LAST_LOGGED_MEAL_DESCRIPTION
     assert by_name["build_context_snapshot"].description == CONTEXT_SNAPSHOT_DESCRIPTION
+    assert by_name["get_personal_timeline"].description == PERSONAL_TIMELINE_DESCRIPTION
+    timeline_schema = by_name["get_personal_timeline"].inputSchema
+    timeline_props = timeline_schema.get("properties") or {}
+    assert set(timeline_props) == {"start", "end", "timezone"}
+    assert "resolution" not in timeline_props
+    assert "limit" not in timeline_props
+    assert "cursor" not in timeline_props
+    assert "bucket" not in timeline_props
     assert "latest logged meal" in LAST_LOGGED_MEAL_DESCRIPTION.lower()
     assert "foods are included" in LAST_LOGGED_MEAL_DESCRIPTION.lower()
     assert "meal notes are excluded" in LAST_LOGGED_MEAL_DESCRIPTION.lower()
@@ -406,4 +416,42 @@ async def test_build_context_snapshot_maps_to_query_client(
     assert data["last_logged_meal"]["foods"] == [UNIQUE_FOOD]
     assert "points" not in data
     assert "stage" not in data["recent_sleep_intervals"]
+    assert_no_secrets(json.dumps(data))
+
+
+@pytest.mark.asyncio
+async def test_get_personal_timeline_maps_to_query_client(
+    mcp_server, fake_query_client: FakeQueryClient
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "get_personal_timeline",
+            {
+                "start": "2026-08-10T04:00:00Z",
+                "end": "2026-08-13T04:00:00Z",
+                "timezone": "America/New_York",
+            },
+        )
+    assert result.is_error is False
+    assert fake_query_client.calls == [
+        (
+            "personal_timeline",
+            {
+                "start": datetime(2026, 8, 10, 4, 0, tzinfo=UTC),
+                "end": datetime(2026, 8, 13, 4, 0, tzinfo=UTC),
+                "timezone": "America/New_York",
+            },
+        )
+    ]
+    data = result.structured_content
+    assert data["glucose_resolution"] == "15m"
+    assert data["glucose"]["aggregation"] == "mean_min_max"
+    assert data["glucose"]["truncated"] is False
+    assert data["meals"][0]["foods"] == [UNIQUE_FOOD]
+    assert "notes" not in data["meals"][0]
+    assert data["sleep_intervals"][0]["stage"] == UNIQUE_STAGE
+    assert "resolution" not in data["glucose"]
+    assert "next_cursor" not in data
+    assert "record_count" not in data
+    assert "truncated" not in data
     assert_no_secrets(json.dumps(data))

@@ -61,6 +61,13 @@ async def test_logs_safe_metadata_not_health_values(
             "build_context_snapshot",
             {"anchor": "2026-08-15T14:00:00Z"},
         )
+        await client.call_tool(
+            "get_personal_timeline",
+            {
+                "start": "2026-08-10T04:00:00Z",
+                "end": "2026-08-13T04:00:00Z",
+            },
+        )
     text = caplog.text
     assert "get_glucose_series" in text
     assert "get_meals" in text
@@ -69,10 +76,17 @@ async def test_logs_safe_metadata_not_health_values(
     assert "get_weight_measurements" in text
     assert "get_last_logged_meal" in text
     assert "build_context_snapshot" in text
+    assert "get_personal_timeline" in text
     assert "latency_ms=" in text
     assert "outcome=ok" in text
     assert "http_status=" not in text
     assert "record_count=" in text
+    timeline_lines = [
+        line for line in caplog.text.splitlines() if "get_personal_timeline" in line
+    ]
+    assert timeline_lines
+    # Four event arrays only; glucose buckets are not included in record_count.
+    assert "record_count=4" in timeline_lines[0]
     assert TEST_MCP_KEY not in text
     assert TEST_READ_KEY not in text
     assert TEST_INGEST_KEY not in text
@@ -85,6 +99,6 @@ async def test_logs_safe_metadata_not_health_values(
     assert UNIQUE_WEIGHT_ID not in text
     assert UNIQUE_STAGE not in text
     assert str(UNIQUE_KG) not in text
-    assert "310" not in text
-    assert "148" not in text
+    assert "average_heart_rate" not in text
+    assert "active_energy_kcal" not in text
     assert "postgresql" not in text.lower()

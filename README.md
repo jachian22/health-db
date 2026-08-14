@@ -7,7 +7,7 @@ Personal FastAPI + PostgreSQL service that ingests an iOS HealthKit export, stor
 - Accept version-1 iOS export payloads via `POST /v1/ingest/batch`
 - Store one raw payload copy per ingestion batch (audit/debug)
 - Upsert typed rows keyed by `(user_id, source, source_sample_id)`
-- Expose Query API v1: `coverage`, `glucose/series`, `glucose/summary`, `meals`, `workouts`, `sleep-intervals`, `weight-measurements`, `last-logged-meal`, `context-snapshot`
+- Expose Query API v1: `coverage`, `glucose/series`, `glucose/summary`, `meals`, `workouts`, `sleep-intervals`, `weight-measurements`, `last-logged-meal`, `context-snapshot`, `personal-timeline`
 - Separate ingest (`INGEST_API_KEY`) and read (`READ_API_KEY`) credentials
 - Request ID on every response (persistent request-audit storage is deferred)
 
@@ -135,6 +135,7 @@ All query endpoints are **read-only**. List/coverage/glucose endpoints require e
 | GET | `/v1/query/weight-measurements` | Weight measurements in `[start, end)`; cursor pagination |
 | GET | `/v1/query/last-logged-meal` | Latest logged meal at or before `anchor` (foods included, notes excluded) |
 | GET | `/v1/query/context-snapshot` | Bounded evidence-only snapshot around `anchor` (no glucose series) |
+| GET | `/v1/query/personal-timeline` | Bounded historical timeline for replay (max 72 elapsed hours; no event pagination) |
 
 Glucose resolution hard limits: raw 7d, 5m 31d, 15m 90d, hourly 365d (oversized ranges rejected). Hard ceiling of **10000** returned glucose points (raw or buckets) → `RESULT_TOO_LARGE`. List endpoints default `limit=100`, max `500` with HMAC-signed cursors bound to the resource and request range. Workout/weight windows max **365** days; sleep-interval windows max **90** days.
 
@@ -142,11 +143,13 @@ Glucose resolution hard limits: raw 7d, 5m 31d, 15m 90d, hourly 365d (oversized 
 
 `GET /v1/query/context-snapshot` returns a partial evidence-only envelope around `anchor`: last logged meal, most recent completed workout (14d), compact raw-sleep aggregate (default 24h, max 36h; no stages/list), most recent weight (30d), glucose-only coverage (`count` / `first_at` / `last_at`) plus overall summary (default 24h, max 48h). It does not return a glucose series. Empty resources are listed in `unavailable`.
 
+`GET /v1/query/personal-timeline` returns one visualization-ready historical envelope for an explicit `[start, end)` window (maximum **72 elapsed hours**). It includes meals with foods (notes excluded), workouts, raw sleep intervals (not sessionized), weight measurements, a **fixed 15-minute** mean/min/max glucose series, and category coverage. Event arrays are not paginated; more than **2000** matching records in any event category returns `RESULT_TOO_LARGE` for the whole request. Prefer this route (and the MCP `get_personal_timeline` tool) for a bounded historical replay window rather than combining category list tools. Recorded data only; no medical advice.
+
 Workouts and sleep intervals use **interval overlap** for both coverage and list endpoints: `start_time < end AND end_time > start`. Coverage `first_at` / `last_at` are min/max stored `start_time` among included records (not `end_time`). Glucose, meals, and weight still count timestamps in `[start, end)` (`sample_time`, `meal_completed_at`, `measured_at`).
 
 Overlap list/coverage queries filter `end_time` without `ix_workouts_user_id_end_time`. After deploy, inspect `EXPLAIN (ANALYZE, BUFFERS)` on those queries and add an index only if the plan or measured latency justifies it.
 
-**Resource protection:** there is **no in-process rate limiter**. Protection is range limits, list page size, glucose point ceiling, and `QUERY_STATEMENT_TIMEOUT_MS` (default 10s) on Query API Postgres statements, plus whatever the host platform provides.
+**Resource protection:** there is **no in-process rate limiter**. Protection is range limits (including the 72-hour personal-timeline cap), list page size, glucose point ceiling, the 2000-item-per-category timeline cap, and `QUERY_STATEMENT_TIMEOUT_MS` (default 10s) on Query API Postgres statements, plus whatever the host platform provides.
 
 **Breaking change (0.2.0):** POST `/v1/query/series/*` and `/v1/query/events/meals` were removed. Use GET `/v1/query/*` only.
 
@@ -282,6 +285,14 @@ curl -sS \
   -H "Authorization: Bearer $READ_API_KEY" | python -m json.tool
 ```
 
+### Personal timeline
+
+```bash
+curl -sS \
+  "http://127.0.0.1:8000/v1/query/personal-timeline?start=2026-08-10T04:00:00Z&end=2026-08-13T04:00:00Z" \
+  -H "Authorization: Bearer $READ_API_KEY" | python -m json.tool
+```
+
 ## Data privacy / logging policy
 
 **Logged (application logs, metadata only):** request ID, path, method, status, error type. Persistent per-request audit rows (`request_audit_logs`) are deferred to a later phase; the Phase 1 schema intentionally omits that table.
@@ -290,7 +301,7 @@ curl -sS \
 
 ## MCP service
 
-Standalone app in `mcp/`. Cursor authenticates with `MCP_API_KEY` only; the MCP service calls Query API with `READ_API_KEY`. Cursor never receives `READ_API_KEY` or `INGEST_API_KEY`. Nine read-only tools, including `get_last_logged_meal` and `build_context_snapshot`. See [docs/mcp.md](docs/mcp.md).
+Standalone app in `mcp/`. Cursor authenticates with `MCP_API_KEY` only; the MCP service calls Query API with `READ_API_KEY`. Cursor never receives `READ_API_KEY` or `INGEST_API_KEY`. Ten read-only tools, including `get_personal_timeline` for a bounded historical replay window. See [docs/mcp.md](docs/mcp.md).
 
 ```bash
 cd mcp && pip install -e ".[dev]" && pytest

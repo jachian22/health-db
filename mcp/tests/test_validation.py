@@ -409,3 +409,77 @@ async def test_m2_tools_non_integer_lookback_rejected_before_upstream(
         )
     assert result.is_error is True
     assert fake_query_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_personal_timeline_naive_start_rejected(
+    mcp_server, fake_query_client: FakeQueryClient
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "get_personal_timeline",
+            {
+                "start": "2026-08-10T04:00:00",
+                "end": "2026-08-13T04:00:00Z",
+            },
+        )
+    assert result.is_error is True
+    body = _payload(result)
+    assert body.get("code") == "INVALID_TIME_RANGE"
+    assert fake_query_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_personal_timeline_invalid_timezone_rejected(
+    mcp_server, fake_query_client: FakeQueryClient
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "get_personal_timeline",
+            {
+                "start": "2026-08-10T04:00:00Z",
+                "end": "2026-08-13T04:00:00Z",
+                "timezone": "Not/A_Zone",
+            },
+        )
+    assert result.is_error is True
+    body = _payload(result)
+    assert body["code"] == "INVALID_TIMEZONE"
+    assert fake_query_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_personal_timeline_end_not_after_start_rejected(
+    mcp_server, fake_query_client: FakeQueryClient
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "get_personal_timeline",
+            {
+                "start": "2026-08-13T04:00:00Z",
+                "end": "2026-08-10T04:00:00Z",
+            },
+        )
+    assert result.is_error is True
+    body = _payload(result)
+    assert body["code"] == "INVALID_TIME_RANGE"
+    assert fake_query_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_personal_timeline_over_72_hours_rejected_before_upstream(
+    mcp_server, fake_query_client: FakeQueryClient
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "get_personal_timeline",
+            {
+                "start": "2026-08-10T04:00:00Z",
+                "end": "2026-08-13T04:00:01Z",
+            },
+        )
+    assert result.is_error is True
+    body = _payload(result)
+    assert body["code"] == "RANGE_TOO_LARGE"
+    assert body["max_hours"] == 72
+    assert fake_query_client.calls == []

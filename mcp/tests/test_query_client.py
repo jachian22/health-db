@@ -17,6 +17,7 @@ from mcp_service.query_api_client import (
     GLUCOSE_SUMMARY_PATH,
     LAST_LOGGED_MEAL_PATH,
     MEALS_PATH,
+    PERSONAL_TIMELINE_PATH,
     READY_PATH,
     SLEEP_INTERVALS_PATH,
     WEIGHT_MEASUREMENTS_PATH,
@@ -32,6 +33,7 @@ from tests.conftest import (
     default_context_snapshot,
     default_coverage,
     default_last_logged_meal,
+    default_personal_timeline,
     make_settings,
     query_error,
 )
@@ -210,6 +212,15 @@ def _tool_error_body(result) -> dict:
             query_error("RANGE_TOO_LARGE", "Raw glucose queries are limited to 7 days", max_days=7),
             "RANGE_TOO_LARGE",
         ),
+        (
+            query_error(
+                "RESULT_TOO_LARGE",
+                "Personal timeline matched more than 2000 sleep_intervals records; narrow the time range",
+                max_items=2000,
+                category="sleep_intervals",
+            ),
+            "RESULT_TOO_LARGE",
+        ),
         (query_error("UPSTREAM_RATE_LIMITED", "The health data service is rate-limiting requests"), "UPSTREAM_RATE_LIMITED"),
         (query_error("UPSTREAM_UNAVAILABLE", "The health data service is unavailable"), "UPSTREAM_UNAVAILABLE"),
         (query_error("UPSTREAM_TIMEOUT", "The health data service timed out"), "UPSTREAM_TIMEOUT"),
@@ -239,6 +250,9 @@ async def test_upstream_errors_map_to_safe_tool_errors(exc: QueryAPIError, code_
     assert_no_secrets(result.content[0].text)
     if exc.code == "RANGE_TOO_LARGE":
         assert body["max_days"] == 7
+    if exc.code == "RESULT_TOO_LARGE":
+        assert body["max_items"] == 2000
+        assert body["category"] == "sleep_intervals"
 
 
 @pytest.mark.asyncio
@@ -417,3 +431,59 @@ async def test_last_logged_meal_maps_422_and_401():
     assert raised_401.value.code == "UPSTREAM_UNAVAILABLE"
     assert TEST_READ_KEY not in raised_401.value.message
     assert "raw body" not in raised_401.value.message
+
+
+@pytest.mark.asyncio
+async def test_personal_timeline_route_iso_z_and_result_too_large():
+    seen: list[httpx.Request] = []
+
+    def handler_ok(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200, json=default_personal_timeline().model_dump(mode="json")
+        )
+
+    client = _client_for(handler_ok)
+    result = await client.get_personal_timeline(
+        start=datetime(2026, 8, 10, 4, 0, tzinfo=UTC),
+        end=datetime(2026, 8, 13, 4, 0, tzinfo=UTC),
+        timezone="America/New_York",
+    )
+    await client.aclose()
+    assert result.glucose_resolution == "15m"
+    request = seen[0]
+    assert request.url.path == PERSONAL_TIMELINE_PATH
+    assert request.url.params["start"].endswith("Z") or "2026-08-10" in request.url.params["start"]
+    assert request.url.params["end"].endswith("Z") or "2026-08-13" in request.url.params["end"]
+    assert request.url.params["timezone"] == "America/New_York"
+    assert "resolution" not in request.url.params
+    assert "limit" not in request.url.params
+    assert request.headers["authorization"] == f"Bearer {TEST_READ_KEY}"
+
+    def handler_422(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            json={
+                "error": {
+                    "code": "RESULT_TOO_LARGE",
+                    "message": (
+                        "Personal timeline matched more than 2000 sleep_intervals "
+                        "records; narrow the time range"
+                    ),
+                    "details": {"max_items": 2000, "category": "sleep_intervals"},
+                }
+            },
+        )
+
+    client = _client_for(handler_422)
+    with pytest.raises(QueryAPIError) as raised:
+        await client.get_personal_timeline(
+            start=datetime(2026, 8, 10, 4, 0, tzinfo=UTC),
+            end=datetime(2026, 8, 13, 4, 0, tzinfo=UTC),
+            timezone="America/New_York",
+        )
+    await client.aclose()
+    assert raised.value.code == "RESULT_TOO_LARGE"
+    assert raised.value.extra["max_items"] == 2000
+    assert raised.value.extra["category"] == "sleep_intervals"
+    assert TEST_READ_KEY not in raised.value.message

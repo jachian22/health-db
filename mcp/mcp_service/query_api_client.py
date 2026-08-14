@@ -21,6 +21,7 @@ from mcp_service.models import (
     GlucoseSummaryResponse,
     LastLoggedMealResponse,
     MealsResponse,
+    PersonalTimelineResponse,
     SleepIntervalsResponse,
     WeightMeasurementsResponse,
     WorkoutsResponse,
@@ -36,6 +37,7 @@ SLEEP_INTERVALS_PATH = "/v1/query/sleep-intervals"
 WEIGHT_MEASUREMENTS_PATH = "/v1/query/weight-measurements"
 LAST_LOGGED_MEAL_PATH = "/v1/query/last-logged-meal"
 CONTEXT_SNAPSHOT_PATH = "/v1/query/context-snapshot"
+PERSONAL_TIMELINE_PATH = "/v1/query/personal-timeline"
 READY_PATH = "/ready"
 
 _SAFE_UNAVAILABLE = "The health data service is unavailable"
@@ -241,6 +243,19 @@ class HealthDBQueryAPIClient:
             },
         )
         return self._parse(ContextSnapshotResponse, data)
+
+    async def get_personal_timeline(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        timezone: str,
+    ) -> PersonalTimelineResponse:
+        data = await self._request(
+            PERSONAL_TIMELINE_PATH,
+            {"start": to_iso8601(start), "end": to_iso8601(end), "timezone": timezone},
+        )
+        return self._parse(PersonalTimelineResponse, data)
 
     async def _get_paged[T](
         self,

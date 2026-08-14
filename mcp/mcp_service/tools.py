@@ -25,6 +25,7 @@ from mcp_service.constants import (
     MAX_PAGE_LIMIT,
     MAX_SLEEP_LOOKBACK_HOURS,
     MAX_SLEEP_RANGE_DAYS,
+    MAX_TIMELINE_RANGE_HOURS,
     MAX_WEIGHT_RANGE_DAYS,
     MAX_WORKOUT_RANGE_DAYS,
 )
@@ -37,15 +38,18 @@ from mcp_service.models import (
     GlucoseSummaryResponse,
     LastLoggedMealResponse,
     MealsResponse,
+    PersonalTimelineResponse,
     SleepIntervalsResponse,
     WeightMeasurementsResponse,
     WorkoutsResponse,
     coverage_record_count,
     enforce_glucose_range_limit,
     enforce_max_range_days,
+    enforce_max_range_hours,
     parse_bound_timestamp,
     parse_timezone,
     summary_record_count,
+    timeline_record_count,
     to_iso8601,
     validate_lookback,
     validate_page_limit,
@@ -141,6 +145,16 @@ CONTEXT_SNAPSHOT_DESCRIPTION = (
     "Time since last logged meal does not confirm fasting. "
     "It does not diagnose, infer symptoms or causality, assess safety or readiness, "
     "or give medical advice or clinical interpretation."
+)
+
+PERSONAL_TIMELINE_DESCRIPTION = (
+    "Return one bounded, visualization-ready historical timeline for an explicit "
+    "[start, end) window (maximum 72 elapsed hours). Includes meals with foods "
+    "(notes excluded), workouts, raw sleep intervals, weight measurements, "
+    "15-minute mean/min/max glucose, and category coverage. Sleep is not "
+    "sessionized. Glucose resolution is fixed at 15m and is not client-selectable. "
+    "This tool reports recorded data only; it does not diagnose, infer causes or "
+    "symptoms, assess safety, or give medical advice."
 )
 
 Start = Annotated[
@@ -244,6 +258,10 @@ class QueryClient(Protocol):
         glucose_lookback_hours: int,
     ) -> ContextSnapshotResponse: ...
 
+    async def get_personal_timeline(
+        self, *, start: datetime, end: datetime, timezone: str
+    ) -> PersonalTimelineResponse: ...
+
 
 def _window(start: datetime, end: datetime, timezone: str) -> tuple[datetime, datetime, str]:
     start_utc, end_utc = validate_time_range(start, end)
@@ -256,6 +274,13 @@ def _iso(value: datetime) -> str | None:
 
 @dataclass(frozen=True)
 class ToolLogMeta:
+    """Safe tool-call log fields. Never log health values or identifiers.
+
+    ``record_count`` is tool-specific: list tools use item count, glucose series
+    uses returned points, and get_personal_timeline uses the sum of the four
+    event arrays (not glucose bucket count).
+    """
+
     start: str | None = None
     end: str | None = None
     timezone: str | None = None
@@ -439,6 +464,8 @@ def build_mcp_server(
             "get_sleep_intervals / get_weight_measurements, "
             "then get_glucose_series, then get_glucose_summary. "
             "Use get_last_logged_meal or build_context_snapshot for anchor-relative context. "
+            "For a bounded historical replay window, prefer get_personal_timeline rather "
+            "than manually combining many category tools. "
             "Always use explicit timezone-aware start/end or a timezone-aware anchor. "
             "Workouts and sleep intervals use overlap inclusion "
             "(start_time < end AND end_time > start) for both coverage and lists. "
@@ -771,6 +798,42 @@ def build_mcp_server(
                 sleep_lookback_hours=sleep_lookback_hours,
                 glucose_lookback_hours=glucose_lookback_hours,
             ),
+        )
+
+    @mcp.tool(
+        name="get_personal_timeline",
+        description=PERSONAL_TIMELINE_DESCRIPTION,
+        annotations=read_only,
+    )
+    async def get_personal_timeline(
+        start: Start,
+        end: End,
+        timezone: Timezone = DEFAULT_QUERY_TIMEZONE,
+    ) -> PersonalTimelineResponse:
+        async def _call() -> PersonalTimelineResponse:
+            start_utc, end_utc, tz = _window(start, end, timezone)
+            enforce_max_range_hours(
+                start_utc,
+                end_utc,
+                max_hours=MAX_TIMELINE_RANGE_HOURS,
+                label="Personal timeline",
+            )
+            return await query_client.get_personal_timeline(
+                start=start_utc, end=end_utc, timezone=tz
+            )
+
+        return await _run_tool(
+            tool_name="get_personal_timeline",
+            call=_call,
+            success_meta=lambda result: _bounds_meta(
+                start,
+                end,
+                timezone,
+                record_count=timeline_record_count(result),
+                truncated=False,
+                resolution="15m",
+            ),
+            error_meta=_bounds_meta(start, end, timezone, resolution="15m"),
         )
 
     return mcp

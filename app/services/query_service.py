@@ -30,6 +30,8 @@ from app.core import (
     MAX_MEAL_LOOKBACK_DAYS,
     MAX_SLEEP_LOOKBACK_HOURS,
     MAX_SLEEP_RANGE_DAYS,
+    MAX_TIMELINE_ITEMS_PER_CATEGORY,
+    MAX_TIMELINE_RANGE_HOURS,
     MAX_WEIGHT_RANGE_DAYS,
     MAX_WORKOUT_RANGE_DAYS,
     RESOLUTION_SECONDS,
@@ -43,6 +45,7 @@ from app.schemas.queries import (
     enforce_glucose_point_limit,
     enforce_glucose_range_limit,
     enforce_max_range_days,
+    enforce_max_range_hours,
     parse_bound_timestamp,
     parse_timezone,
     validate_glucose_resolution,
@@ -56,6 +59,7 @@ from app.schemas.responses import (
     LAST_MEAL_LIMITS_FOUND,
     LAST_MEAL_LIMITS_MISSING,
     SNAPSHOT_LIMITS,
+    TIMELINE_LIMITS,
     ContextSnapshotResponse,
     CoverageCategory,
     CoverageMap,
@@ -70,9 +74,11 @@ from app.schemas.responses import (
     LastMealDerived,
     MealItem,
     MealsResponse,
+    PersonalTimelineResponse,
     RecentSleepIntervals,
     SleepIntervalItem,
     SleepIntervalsResponse,
+    TimelineGlucoseSeries,
     UnavailableItem,
     WeightMeasurementItem,
     WeightMeasurementsResponse,
@@ -259,6 +265,17 @@ def _interval_freshness(items: Sequence[Any]) -> datetime | None:
 
 
 @dataclass(frozen=True)
+class _AggregatedGlucose:
+    source_record_count: int
+    data_fresh_through: datetime | None
+    points: list[GlucoseBucketPoint]
+
+    @property
+    def returned_point_count(self) -> int:
+        return len(self.points)
+
+
+@dataclass(frozen=True)
 class _ListWindow:
     request_id: str
     start_utc: datetime
@@ -296,6 +313,17 @@ def _workout_item(row: Any) -> WorkoutItem:
         sport=row.sport,
         distance_meters=_dec(row.distance_meters),
         duration_minutes=_duration_minutes(row.start_time, row.end_time),
+        source=row.source,
+    )
+
+
+def _sleep_item(row: Any) -> SleepIntervalItem:
+    return SleepIntervalItem(
+        id=row.source_sample_id,
+        start_time=_ensure_aware(row.start_time),
+        end_time=_ensure_aware(row.end_time),
+        duration_minutes=_duration_minutes(row.start_time, row.end_time),
+        stage=row.stage,
         source=row.source,
     )
 
@@ -602,13 +630,24 @@ class HealthDataQueryService:
                 end=end_utc,
                 timezone=tz_name,
             )
-        return await self._glucose_aggregated(
-            request_id=request_id,
+        aggregated = await self._load_aggregated_glucose(
             user_id=user.id,
             start=start_utc,
             end=end_utc,
-            timezone=tz_name,
             resolution=resolution,
+        )
+        return GlucoseSeriesResponse(
+            request_id=request_id,
+            start=start_utc,
+            end=end_utc,
+            timezone=tz_name,
+            resolution=resolution,  # type: ignore[arg-type]
+            aggregation="mean_min_max",
+            source_record_count=aggregated.source_record_count,
+            returned_point_count=aggregated.returned_point_count,
+            truncated=False,
+            data_fresh_through=aggregated.data_fresh_through,
+            points=aggregated.points,
         )
 
     async def glucose_summary(
@@ -824,14 +863,7 @@ class HealthDataQueryService:
             window=window,
             rows=rows,
             kind="sleep_intervals",
-            item_builder=lambda row: SleepIntervalItem(
-                id=row.source_sample_id,
-                start_time=_ensure_aware(row.start_time),
-                end_time=_ensure_aware(row.end_time),
-                duration_minutes=_duration_minutes(row.start_time, row.end_time),
-                stage=row.stage,
-                source=row.source,
-            ),
+            item_builder=_sleep_item,
             stamp_of_row=lambda row: row.start_time,
             id_of_row=lambda row: row.source_sample_id,
             fresh_of_items=_interval_freshness,
@@ -1045,6 +1077,63 @@ class HealthDataQueryService:
             limits=list(SNAPSHOT_LIMITS),
         )
 
+    async def personal_timeline(
+        self,
+        *,
+        request_id: str,
+        start: datetime,
+        end: datetime,
+        timezone: str | None,
+    ) -> PersonalTimelineResponse:
+        start_utc, end_utc = validate_time_range(start, end)
+        tz_name = parse_timezone(timezone)
+        enforce_max_range_hours(
+            start_utc,
+            end_utc,
+            max_hours=MAX_TIMELINE_RANGE_HOURS,
+            label="Personal timeline",
+        )
+        user = await self.resolve_personal_user()
+        user_id = user.id
+
+        meals = await self._fetch_timeline_meals(user_id, start_utc, end_utc)
+        workouts = await self._fetch_timeline_workouts(user_id, start_utc, end_utc)
+        sleep_intervals = await self._fetch_timeline_sleep_intervals(
+            user_id, start_utc, end_utc
+        )
+        weight_measurements = await self._fetch_timeline_weight_measurements(
+            user_id, start_utc, end_utc
+        )
+        glucose = await self._load_aggregated_glucose(
+            user_id=user_id,
+            start=start_utc,
+            end=end_utc,
+            resolution="15m",
+        )
+        coverage = await self._coverage_map(user_id, start_utc, end_utc)
+
+        return PersonalTimelineResponse(
+            request_id=request_id,
+            start=start_utc,
+            end=end_utc,
+            timezone=tz_name,
+            glucose_resolution="15m",
+            meals=meals,
+            workouts=workouts,
+            sleep_intervals=sleep_intervals,
+            weight_measurements=weight_measurements,
+            glucose=TimelineGlucoseSeries(
+                aggregation="mean_min_max",
+                source_record_count=glucose.source_record_count,
+                returned_point_count=glucose.returned_point_count,
+                truncated=False,
+                data_fresh_through=glucose.data_fresh_through,
+                points=glucose.points,
+            ),
+            coverage=coverage,
+            limits=list(TIMELINE_LIMITS),
+        )
+
     async def _select_last_logged_meal(
         self,
         user_id: uuid.UUID,
@@ -1182,6 +1271,140 @@ class HealthDataQueryService:
         row = (await self.session.execute(stmt)).first()
         return _weight_item(row) if row is not None else None
 
+    def _enforce_timeline_item_cap(self, rows: Sequence[Any], *, category: str) -> None:
+        if len(rows) > MAX_TIMELINE_ITEMS_PER_CATEGORY:
+            raise AppError(
+                code="RESULT_TOO_LARGE",
+                message=(
+                    f"Personal timeline matched more than {MAX_TIMELINE_ITEMS_PER_CATEGORY} "
+                    f"{category} records; narrow the time range"
+                ),
+                status_code=422,
+                details={
+                    "max_items": MAX_TIMELINE_ITEMS_PER_CATEGORY,
+                    "category": category,
+                },
+            )
+
+    async def _fetch_capped[T](
+        self,
+        stmt: Any,
+        *,
+        category: str,
+        item_builder: Callable[[Any], T],
+    ) -> list[T]:
+        rows = list((await self.session.execute(stmt)).all())
+        self._enforce_timeline_item_cap(rows, category=category)
+        return [item_builder(row) for row in rows]
+
+    async def _fetch_timeline_meals(
+        self,
+        user_id: uuid.UUID,
+        start_utc: datetime,
+        end_utc: datetime,
+    ) -> list[MealItem]:
+        stmt = (
+            select(
+                MealEvent.source_sample_id,
+                MealEvent.meal_completed_at,
+                MealEvent.foods,
+                MealEvent.source,
+            )
+            .where(
+                MealEvent.user_id == user_id,
+                MealEvent.deleted_at.is_(None),
+                MealEvent.meal_completed_at >= start_utc,
+                MealEvent.meal_completed_at < end_utc,
+            )
+            .order_by(MealEvent.meal_completed_at.asc(), MealEvent.source_sample_id.asc())
+            .limit(MAX_TIMELINE_ITEMS_PER_CATEGORY + 1)
+        )
+        return await self._fetch_capped(stmt, category="meals", item_builder=_meal_item)
+
+    async def _fetch_timeline_workouts(
+        self,
+        user_id: uuid.UUID,
+        start_utc: datetime,
+        end_utc: datetime,
+    ) -> list[WorkoutItem]:
+        stmt = (
+            select(
+                Workout.source_sample_id,
+                Workout.start_time,
+                Workout.end_time,
+                Workout.sport,
+                Workout.distance_meters,
+                Workout.source,
+            )
+            .where(
+                Workout.user_id == user_id,
+                Workout.deleted_at.is_(None),
+                Workout.start_time < end_utc,
+                Workout.end_time > start_utc,
+            )
+            .order_by(Workout.start_time.asc(), Workout.source_sample_id.asc())
+            .limit(MAX_TIMELINE_ITEMS_PER_CATEGORY + 1)
+        )
+        return await self._fetch_capped(
+            stmt, category="workouts", item_builder=_workout_item
+        )
+
+    async def _fetch_timeline_sleep_intervals(
+        self,
+        user_id: uuid.UUID,
+        start_utc: datetime,
+        end_utc: datetime,
+    ) -> list[SleepIntervalItem]:
+        stmt = (
+            select(
+                SleepInterval.source_sample_id,
+                SleepInterval.start_time,
+                SleepInterval.end_time,
+                SleepInterval.stage,
+                SleepInterval.source,
+            )
+            .where(
+                SleepInterval.user_id == user_id,
+                SleepInterval.deleted_at.is_(None),
+                SleepInterval.start_time < end_utc,
+                SleepInterval.end_time > start_utc,
+            )
+            .order_by(SleepInterval.start_time.asc(), SleepInterval.source_sample_id.asc())
+            .limit(MAX_TIMELINE_ITEMS_PER_CATEGORY + 1)
+        )
+        return await self._fetch_capped(
+            stmt, category="sleep_intervals", item_builder=_sleep_item
+        )
+
+    async def _fetch_timeline_weight_measurements(
+        self,
+        user_id: uuid.UUID,
+        start_utc: datetime,
+        end_utc: datetime,
+    ) -> list[WeightMeasurementItem]:
+        stmt = (
+            select(
+                WeightMeasurement.source_sample_id,
+                WeightMeasurement.measured_at,
+                WeightMeasurement.value_kg,
+                WeightMeasurement.source,
+            )
+            .where(
+                WeightMeasurement.user_id == user_id,
+                WeightMeasurement.deleted_at.is_(None),
+                WeightMeasurement.measured_at >= start_utc,
+                WeightMeasurement.measured_at < end_utc,
+            )
+            .order_by(
+                WeightMeasurement.measured_at.asc(),
+                WeightMeasurement.source_sample_id.asc(),
+            )
+            .limit(MAX_TIMELINE_ITEMS_PER_CATEGORY + 1)
+        )
+        return await self._fetch_capped(
+            stmt, category="weight_measurements", item_builder=_weight_item
+        )
+
     async def _glucose_raw(
         self,
         *,
@@ -1226,16 +1449,14 @@ class HealthDataQueryService:
             points=points,
         )
 
-    async def _glucose_aggregated(
+    async def _load_aggregated_glucose(
         self,
         *,
-        request_id: str,
         user_id: uuid.UUID,
         start: datetime,
         end: datetime,
-        timezone: str,
         resolution: str,
-    ) -> GlucoseSeriesResponse:
+    ) -> _AggregatedGlucose:
         bucket_seconds = RESOLUTION_SECONDS[resolution]
         # UTC-aligned epoch bucketing: floor(epoch / N) * N
         bucket_start = func.to_timestamp(
@@ -1285,17 +1506,8 @@ class HealthDataQueryService:
                     sample_count=int(row.sample_count),
                 )
             )
-
-        return GlucoseSeriesResponse(
-            request_id=request_id,
-            start=start,
-            end=end,
-            timezone=timezone,
-            resolution=resolution,  # type: ignore[arg-type]
-            aggregation="mean_min_max",
+        return _AggregatedGlucose(
             source_record_count=source_record_count,
-            returned_point_count=len(points),
-            truncated=False,
             data_fresh_through=fresh,
             points=points,
         )

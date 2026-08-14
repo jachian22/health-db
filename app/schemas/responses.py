@@ -199,6 +199,14 @@ SNAPSHOT_LIMITS = (
     "This response reports recorded data and transparent calculations only; it does not diagnose, explain symptoms, assess safety, or provide medical advice.",
 )
 
+TIMELINE_LIMITS = (
+    "The response is read-only historical data.",
+    "Meals may include logged foods; notes are excluded.",
+    "Sleep entries are raw synced intervals, not sleep sessions or a sleep-quality assessment.",
+    "The glucose series is aggregated at 15-minute resolution.",
+    "The timeline reports records only and does not provide diagnosis, causal explanations, safety assessment, or medical advice.",
+)
+
 
 class LastMealDerived(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -259,4 +267,32 @@ class ContextSnapshotResponse(BaseModel):
     glucose_summary: GlucoseSummaryStats
     derived: LastMealDerived
     unavailable: list[UnavailableItem] = Field(default_factory=list)
+    limits: list[str]
+
+
+class TimelineGlucoseSeries(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    aggregation: Literal["mean_min_max"]
+    source_record_count: int
+    returned_point_count: int
+    truncated: bool = False
+    data_fresh_through: datetime | None = None
+    points: list[GlucoseBucketPoint] = Field(default_factory=list)
+
+
+class PersonalTimelineResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    start: datetime
+    end: datetime
+    timezone: str
+    glucose_resolution: Literal["15m"]
+    meals: list[MealItem] = Field(default_factory=list)
+    workouts: list[WorkoutItem] = Field(default_factory=list)
+    sleep_intervals: list[SleepIntervalItem] = Field(default_factory=list)
+    weight_measurements: list[WeightMeasurementItem] = Field(default_factory=list)
+    glucose: TimelineGlucoseSeries
+    coverage: CoverageMap
     limits: list[str]
