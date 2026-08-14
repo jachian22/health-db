@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import Annotated, Literal, Protocol
 
@@ -10,11 +12,11 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from app.config import Settings
-from app.constants import DEFAULT_MEAL_LIMIT, DEFAULT_QUERY_TIMEZONE, MAX_MEAL_LIMIT
-from app.errors import QueryAPIError, ToolError
-from app.logging import current_request_id, log_request
-from app.models import (
+from mcp_service.config import Settings
+from mcp_service.constants import DEFAULT_MEAL_LIMIT, DEFAULT_QUERY_TIMEZONE, MAX_MEAL_LIMIT
+from mcp_service.errors import QueryAPIError, ToolError
+from mcp_service.logging import current_request_id, log_request
+from mcp_service.models import (
     CoverageResponse,
     GlucoseSeriesResponse,
     GlucoseSummaryResponse,
@@ -23,9 +25,8 @@ from app.models import (
     enforce_glucose_range_limit,
     parse_timezone,
     summary_record_count,
-    validate_glucose_resolution,
+    to_iso8601,
     validate_meal_limit,
-    validate_summary_bucket,
     validate_time_range,
 )
 
@@ -60,8 +61,22 @@ MEALS_DESCRIPTION = (
     "Use returned next_cursor to fetch later pages only when necessary."
 )
 
+Start = Annotated[
+    datetime, Field(description="Inclusive range start (ISO-8601 with timezone)")
+]
+End = Annotated[
+    datetime, Field(description="Exclusive range end (ISO-8601 with timezone)")
+]
+Timezone = Annotated[
+    str, Field(description=f"IANA timezone (default {DEFAULT_QUERY_TIMEZONE})")
+]
+
 
 class QueryClient(Protocol):
+    async def check_ready(self) -> bool: ...
+
+    async def aclose(self) -> None: ...
+
     async def get_coverage(
         self, *, start: datetime, end: datetime, timezone: str
     ) -> CoverageResponse: ...
@@ -85,11 +100,9 @@ class QueryClient(Protocol):
     ) -> MealsResponse: ...
 
 
-def _iso(value: datetime) -> str:
-    text = value.isoformat()
-    if text.endswith("+00:00"):
-        return text[:-6] + "Z"
-    return text
+def _window(start: datetime, end: datetime, timezone: str) -> tuple[datetime, datetime, str]:
+    start_utc, end_utc = validate_time_range(start, end)
+    return start_utc, end_utc, parse_timezone(timezone)
 
 
 async def _run_tool[T](
@@ -98,32 +111,31 @@ async def _run_tool[T](
     start: datetime,
     end: datetime,
     timezone: str,
+    call: Callable[[], Awaitable[T]],
+    count_of: Callable[[T], int],
+    truncated_of: Callable[[T], bool] | None = None,
     resolution: str | None = None,
     bucket: str | None = None,
-    coro,
-    count_of,
-    truncated_of=None,
 ) -> T:
     request_id = current_request_id()
     started = time.perf_counter()
     try:
-        result = await coro
+        result = await call()
         latency_ms = (time.perf_counter() - started) * 1000
         truncated = truncated_of(result) if truncated_of else None
         log_request(
             request_id=request_id,
             category="tools/call",
             tool_name=tool_name,
-            http_status=200,
+            outcome="ok",
             principal="mcp_caller",
-            start=_iso(start),
-            end=_iso(end),
+            start=to_iso8601(start),
+            end=to_iso8601(end),
             timezone=timezone,
             resolution=resolution,
             bucket=bucket,
             record_count=count_of(result),
             truncated=truncated,
-            upstream_outcome="ok",
             latency_ms=latency_ms,
         )
         return result
@@ -133,14 +145,13 @@ async def _run_tool[T](
             request_id=request_id,
             category="tools/call",
             tool_name=tool_name,
-            http_status=422,
+            outcome="validation_error",
             principal="mcp_caller",
-            start=_iso(start) if start.tzinfo else None,
-            end=_iso(end) if end.tzinfo else None,
+            start=to_iso8601(start) if start.tzinfo else None,
+            end=to_iso8601(end) if end.tzinfo else None,
             timezone=timezone,
             resolution=resolution,
             bucket=bucket,
-            upstream_outcome="validation_error",
             latency_ms=latency_ms,
             error_code=exc.code,
         )
@@ -153,21 +164,25 @@ async def _run_tool[T](
             request_id=request_id,
             category="tools/call",
             tool_name=tool_name,
-            http_status=502,
+            outcome=exc.code.lower(),
             principal="mcp_caller",
-            start=_iso(start),
-            end=_iso(end),
+            start=to_iso8601(start),
+            end=to_iso8601(end),
             timezone=timezone,
             resolution=resolution,
             bucket=bucket,
-            upstream_outcome=exc.code.lower(),
             latency_ms=latency_ms,
             error_code=exc.code,
         )
         raise exc.to_tool_error(request_id=request_id) from exc
 
 
-def build_mcp_server(settings: Settings, query_client: QueryClient) -> MCPServer:
+def build_mcp_server(
+    settings: Settings,
+    query_client: QueryClient,
+    *,
+    lifespan: Callable[[MCPServer], AbstractAsyncContextManager[object]] | None = None,
+) -> MCPServer:
     mcp = MCPServer(
         settings.mcp_service_name,
         version=settings.mcp_service_version,
@@ -178,24 +193,18 @@ def build_mcp_server(settings: Settings, query_client: QueryClient) -> MCPServer
             "Always use explicit timezone-aware start/end. "
             "Do not give medical advice, diagnosis, or clinical interpretation."
         ),
+        lifespan=lifespan,
     )
     read_only = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
 
     @mcp.tool(name="get_data_coverage", description=COVERAGE_DESCRIPTION, annotations=read_only)
     async def get_data_coverage(
-        start: Annotated[
-            datetime, Field(description="Inclusive range start (ISO-8601 with timezone)")
-        ],
-        end: Annotated[
-            datetime, Field(description="Exclusive range end (ISO-8601 with timezone)")
-        ],
-        timezone: Annotated[
-            str, Field(description=f"IANA timezone (default {DEFAULT_QUERY_TIMEZONE})")
-        ] = DEFAULT_QUERY_TIMEZONE,
+        start: Start,
+        end: End,
+        timezone: Timezone = DEFAULT_QUERY_TIMEZONE,
     ) -> CoverageResponse:
         async def _call() -> CoverageResponse:
-            start_utc, end_utc = validate_time_range(start, end)
-            tz = parse_timezone(timezone)
+            start_utc, end_utc, tz = _window(start, end, timezone)
             return await query_client.get_coverage(start=start_utc, end=end_utc, timezone=tz)
 
         return await _run_tool(
@@ -203,7 +212,7 @@ def build_mcp_server(settings: Settings, query_client: QueryClient) -> MCPServer
             start=start,
             end=end,
             timezone=timezone,
-            coro=_call(),
+            call=_call,
             count_of=coverage_record_count,
         )
 
@@ -213,27 +222,19 @@ def build_mcp_server(settings: Settings, query_client: QueryClient) -> MCPServer
         annotations=read_only,
     )
     async def get_glucose_series(
-        start: Annotated[
-            datetime, Field(description="Inclusive range start (ISO-8601 with timezone)")
-        ],
-        end: Annotated[
-            datetime, Field(description="Exclusive range end (ISO-8601 with timezone)")
-        ],
+        start: Start,
+        end: End,
         resolution: Annotated[
             Literal["raw", "5m", "15m", "hourly"],
             Field(description="Series resolution: raw, 5m, 15m, or hourly (default 15m)"),
         ] = "15m",
-        timezone: Annotated[
-            str, Field(description=f"IANA timezone (default {DEFAULT_QUERY_TIMEZONE})")
-        ] = DEFAULT_QUERY_TIMEZONE,
+        timezone: Timezone = DEFAULT_QUERY_TIMEZONE,
     ) -> GlucoseSeriesResponse:
         async def _call() -> GlucoseSeriesResponse:
-            start_utc, end_utc = validate_time_range(start, end)
-            tz = parse_timezone(timezone)
-            resolved = validate_glucose_resolution(resolution)
-            enforce_glucose_range_limit(start_utc, end_utc, resolved)
+            start_utc, end_utc, tz = _window(start, end, timezone)
+            enforce_glucose_range_limit(start_utc, end_utc, resolution)
             return await query_client.get_glucose_series(
-                start=start_utc, end=end_utc, resolution=resolved, timezone=tz
+                start=start_utc, end=end_utc, resolution=resolution, timezone=tz
             )
 
         return await _run_tool(
@@ -242,7 +243,7 @@ def build_mcp_server(settings: Settings, query_client: QueryClient) -> MCPServer
             end=end,
             timezone=timezone,
             resolution=resolution,
-            coro=_call(),
+            call=_call,
             count_of=lambda r: r.returned_point_count,
             truncated_of=lambda r: r.truncated,
         )
@@ -253,26 +254,18 @@ def build_mcp_server(settings: Settings, query_client: QueryClient) -> MCPServer
         annotations=read_only,
     )
     async def get_glucose_summary(
-        start: Annotated[
-            datetime, Field(description="Inclusive range start (ISO-8601 with timezone)")
-        ],
-        end: Annotated[
-            datetime, Field(description="Exclusive range end (ISO-8601 with timezone)")
-        ],
+        start: Start,
+        end: End,
         bucket: Annotated[
             Literal["overall", "daily"],
             Field(description="Summary bucketing mode: overall or daily (default overall)"),
         ] = "overall",
-        timezone: Annotated[
-            str, Field(description=f"IANA timezone (default {DEFAULT_QUERY_TIMEZONE})")
-        ] = DEFAULT_QUERY_TIMEZONE,
+        timezone: Timezone = DEFAULT_QUERY_TIMEZONE,
     ) -> GlucoseSummaryResponse:
         async def _call() -> GlucoseSummaryResponse:
-            start_utc, end_utc = validate_time_range(start, end)
-            tz = parse_timezone(timezone)
-            resolved_bucket = validate_summary_bucket(bucket)
+            start_utc, end_utc, tz = _window(start, end, timezone)
             return await query_client.get_glucose_summary(
-                start=start_utc, end=end_utc, bucket=resolved_bucket, timezone=tz
+                start=start_utc, end=end_utc, bucket=bucket, timezone=tz
             )
 
         return await _run_tool(
@@ -281,27 +274,23 @@ def build_mcp_server(settings: Settings, query_client: QueryClient) -> MCPServer
             end=end,
             timezone=timezone,
             bucket=bucket,
-            coro=_call(),
+            call=_call,
             count_of=summary_record_count,
         )
 
     @mcp.tool(name="get_meals", description=MEALS_DESCRIPTION, annotations=read_only)
     async def get_meals(
-        start: Annotated[
-            datetime, Field(description="Inclusive range start (ISO-8601 with timezone)")
-        ],
-        end: Annotated[
-            datetime, Field(description="Exclusive range end (ISO-8601 with timezone)")
-        ],
-        timezone: Annotated[
-            str, Field(description=f"IANA timezone (default {DEFAULT_QUERY_TIMEZONE})")
-        ] = DEFAULT_QUERY_TIMEZONE,
+        start: Start,
+        end: End,
+        timezone: Timezone = DEFAULT_QUERY_TIMEZONE,
         limit: Annotated[
             int,
             Field(
+                ge=1,
+                le=MAX_MEAL_LIMIT,
                 description=(
                     f"Page size (default {DEFAULT_MEAL_LIMIT}, maximum {MAX_MEAL_LIMIT})"
-                )
+                ),
             ),
         ] = DEFAULT_MEAL_LIMIT,
         cursor: Annotated[
@@ -310,8 +299,7 @@ def build_mcp_server(settings: Settings, query_client: QueryClient) -> MCPServer
         ] = None,
     ) -> MealsResponse:
         async def _call() -> MealsResponse:
-            start_utc, end_utc = validate_time_range(start, end)
-            tz = parse_timezone(timezone)
+            start_utc, end_utc, tz = _window(start, end, timezone)
             resolved_limit = validate_meal_limit(limit)
             return await query_client.get_meals(
                 start=start_utc,
@@ -326,7 +314,7 @@ def build_mcp_server(settings: Settings, query_client: QueryClient) -> MCPServer
             start=start,
             end=end,
             timezone=timezone,
-            coro=_call(),
+            call=_call,
             count_of=lambda r: r.record_count,
             truncated_of=lambda r: r.truncated,
         )

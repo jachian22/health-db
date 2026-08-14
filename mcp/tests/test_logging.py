@@ -40,7 +40,8 @@ async def test_logs_safe_metadata_not_health_values(
     assert "get_glucose_series" in text
     assert "get_meals" in text
     assert "latency_ms=" in text
-    assert "upstream_outcome=ok" in text
+    assert "outcome=ok" in text
+    assert "http_status=" not in text
     assert "record_count=" in text
     assert TEST_MCP_KEY not in text
     assert TEST_READ_KEY not in text

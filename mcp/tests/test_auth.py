@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from starlette.testclient import TestClient
 
-from tests.conftest import TEST_INGEST_KEY, TEST_MCP_KEY, TEST_READ_KEY, assert_no_secrets
+from tests.conftest import (
+    TEST_INGEST_KEY,
+    TEST_MCP_KEY,
+    TEST_READ_KEY,
+    assert_no_secrets,
+    parse_mcp_http_body,
+)
 
 
 def test_missing_authorization_returns_401(client: TestClient):
@@ -122,7 +128,7 @@ def test_authenticated_http_lists_four_tools(client: TestClient, mcp_headers: di
         json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
     )
     assert listed.status_code == 200
-    payload = listed.json()
+    payload = parse_mcp_http_body(listed)
     assert "result" in payload
     names = [tool["name"] for tool in payload["result"]["tools"]]
     assert names == [
@@ -184,6 +190,11 @@ def test_unexpected_origin_is_rejected(client: TestClient, mcp_headers: dict[str
         json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
     )
     assert resp.status_code == 403
+
+
+def test_auth_does_not_apply_to_mcp_prefix_paths(client: TestClient):
+    resp = client.get("/mcp-admin")
+    assert resp.status_code != 401
 
 
 def test_no_permissive_cors_star(client: TestClient):

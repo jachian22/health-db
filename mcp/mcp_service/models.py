@@ -8,29 +8,27 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.constants import (
-    ALLOWED_GLUCOSE_RESOLUTIONS,
-    ALLOWED_SUMMARY_BUCKETS,
+from mcp_service.constants import (
     DEFAULT_MEAL_LIMIT,
     DEFAULT_QUERY_TIMEZONE,
     MAX_MEAL_LIMIT,
     RESOLUTION_LABELS,
     RESOLUTION_MAX_DAYS,
 )
-from app.errors import ToolError
+from mcp_service.errors import ToolError
 
 
-class CoverageCategory(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class QueryModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
+
+class CoverageCategory(QueryModel):
     count: int
     first_at: datetime | None = None
     last_at: datetime | None = None
 
 
-class CoverageMap(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
+class CoverageMap(QueryModel):
     glucose: CoverageCategory
     meals: CoverageCategory
     workouts: CoverageCategory
@@ -38,9 +36,7 @@ class CoverageMap(BaseModel):
     weight_measurements: CoverageCategory
 
 
-class CoverageResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
+class CoverageResponse(QueryModel):
     request_id: str
     start: datetime
     end: datetime
@@ -48,16 +44,12 @@ class CoverageResponse(BaseModel):
     coverage: CoverageMap
 
 
-class GlucoseRawPoint(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
+class GlucoseRawPoint(QueryModel):
     timestamp: datetime
     value_mg_dl: float
 
 
-class GlucoseBucketPoint(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
+class GlucoseBucketPoint(QueryModel):
     start: datetime
     end: datetime
     mean_mg_dl: float
@@ -66,9 +58,7 @@ class GlucoseBucketPoint(BaseModel):
     sample_count: int
 
 
-class GlucoseSeriesResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
+class GlucoseSeriesResponse(QueryModel):
     request_id: str
     start: datetime
     end: datetime
@@ -82,9 +72,7 @@ class GlucoseSeriesResponse(BaseModel):
     points: list[GlucoseRawPoint | GlucoseBucketPoint] = Field(default_factory=list)
 
 
-class GlucoseSummaryStats(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
+class GlucoseSummaryStats(QueryModel):
     sample_count: int
     first_at: datetime | None = None
     last_at: datetime | None = None
@@ -94,9 +82,7 @@ class GlucoseSummaryStats(BaseModel):
     median_mg_dl: float | None = None
 
 
-class GlucoseDailySummary(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
+class GlucoseDailySummary(QueryModel):
     local_date: date
     sample_count: int
     first_at: datetime
@@ -107,9 +93,7 @@ class GlucoseDailySummary(BaseModel):
     median_mg_dl: float
 
 
-class GlucoseSummaryResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
+class GlucoseSummaryResponse(QueryModel):
     request_id: str
     start: datetime
     end: datetime
@@ -119,18 +103,14 @@ class GlucoseSummaryResponse(BaseModel):
     days: list[GlucoseDailySummary] | None = None
 
 
-class MealItem(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
+class MealItem(QueryModel):
     id: str
     meal_completed_at: datetime
     foods: list[str]
     source: str
 
 
-class MealsResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
+class MealsResponse(QueryModel):
     request_id: str
     start: datetime
     end: datetime
@@ -140,6 +120,13 @@ class MealsResponse(BaseModel):
     next_cursor: str | None = None
     data_fresh_through: datetime | None = None
     items: list[MealItem] = Field(default_factory=list)
+
+
+def to_iso8601(value: datetime) -> str:
+    text = value.isoformat()
+    if text.endswith("+00:00"):
+        return text[:-6] + "Z"
+    return text
 
 
 def parse_timezone(name: str | None) -> str:
@@ -176,15 +163,6 @@ def validate_time_range(start: datetime, end: datetime) -> tuple[datetime, datet
     return start_aware, end_aware
 
 
-def validate_glucose_resolution(resolution: str) -> str:
-    if resolution not in ALLOWED_GLUCOSE_RESOLUTIONS:
-        raise ToolError(
-            code="INVALID_RESOLUTION",
-            message="resolution must be one of: raw, 5m, 15m, hourly",
-        )
-    return resolution
-
-
 def enforce_glucose_range_limit(start: datetime, end: datetime, resolution: str) -> None:
     max_days = RESOLUTION_MAX_DAYS[resolution]
     if end - start > timedelta(days=max_days):
@@ -194,15 +172,6 @@ def enforce_glucose_range_limit(start: datetime, end: datetime, resolution: str)
             message=f"{label} glucose queries are limited to {max_days} days",
             max_days=max_days,
         )
-
-
-def validate_summary_bucket(bucket: str) -> str:
-    if bucket not in ALLOWED_SUMMARY_BUCKETS:
-        raise ToolError(
-            code="INVALID_BUCKET",
-            message="bucket must be one of: overall, daily",
-        )
-    return bucket
 
 
 def validate_meal_limit(limit: int | None) -> int:

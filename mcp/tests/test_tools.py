@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 import pytest
 from mcp import Client
 
-from app.tools import (
+from mcp_service.tools import (
     COVERAGE_DESCRIPTION,
     GLUCOSE_SERIES_DESCRIPTION,
     GLUCOSE_SUMMARY_DESCRIPTION,
@@ -48,7 +48,7 @@ async def test_lists_exactly_four_tools(mcp_server):
     assert "raw: maximum 7 days" in by_name["get_glucose_series"].description
     assert "does not provide medical advice" in by_name["get_glucose_summary"].description
     assert "Meal notes are intentionally excluded" in by_name["get_meals"].description
-    assert COVERAGE_DESCRIPTION in by_name["get_data_coverage"].description or True
+    assert by_name["get_data_coverage"].description == COVERAGE_DESCRIPTION
     assert "15m: maximum 90 days" in GLUCOSE_SERIES_DESCRIPTION
     assert "Daily grouping" in GLUCOSE_SUMMARY_DESCRIPTION
     assert "next_cursor" in MEALS_DESCRIPTION
@@ -98,7 +98,7 @@ async def test_get_glucose_series_maps_resolution(
     assert fake_query_client.calls[0][0] == "glucose_series"
     assert fake_query_client.calls[0][1]["resolution"] == "5m"
     data = result.structured_content
-    assert data["resolution"] == "15m" or "returned_point_count" in data
+    assert data["resolution"] == "5m"
     assert data["returned_point_count"] == 1
     assert data["truncated"] is False
     assert "aggregation" in data
@@ -122,7 +122,7 @@ async def test_get_glucose_summary_maps_bucket(
     assert fake_query_client.calls[0][0] == "glucose_summary"
     assert fake_query_client.calls[0][1]["bucket"] == "daily"
     data = result.structured_content
-    assert data["bucket"] in {"overall", "daily"}
+    assert data["bucket"] == "daily"
     assert "start" in data and "end" in data and "timezone" in data
 
 

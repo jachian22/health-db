@@ -8,8 +8,8 @@ import pytest
 from mcp import Client
 from starlette.testclient import TestClient
 
-from app.config import Settings
-from app.main import create_app
+from mcp_service.config import Settings
+from mcp_service.main import create_app
 from tests.conftest import FakeQueryClient, make_settings
 
 
@@ -42,12 +42,9 @@ def test_two_independent_requests_need_no_session_id(
     assert second.headers.get("mcp-session-id") in {None, ""}
 
 
-def test_no_custom_session_state_is_persisted(app):
-    mcp = app.state.mcp
-    manager = getattr(mcp, "session_manager", None)
-    assert manager is not None
-    # Stateless HTTP: no event store and no required session tracking.
-    assert getattr(manager, "event_store", None) is None
+def test_streamable_http_is_stateless(app):
+    manager = app.state.mcp.session_manager
+    assert manager.stateless is True
 
 
 @pytest.mark.asyncio
@@ -111,14 +108,27 @@ def test_settings_have_no_database_configuration():
 
 
 def test_mcp_package_does_not_import_sqlalchemy_or_backend_db():
-    import app.config
-    import app.main
-    import app.query_api_client
-    import app.tools
+    import mcp_service.config
+    import mcp_service.main
+    import mcp_service.query_api_client
+    import mcp_service.tools
 
-    for module in (app.config, app.main, app.query_api_client, app.tools):
+    for module in (
+        mcp_service.config,
+        mcp_service.main,
+        mcp_service.query_api_client,
+        mcp_service.tools,
+    ):
         source = inspect.getsource(module)
         assert "sqlalchemy" not in source
+        assert "fastapi" not in source.lower()
         assert "app.db" not in source
         assert "create_engine" not in source
         assert "DATABASE_URL" not in source
+
+
+def test_create_app_returns_starlette(settings):
+    from starlette.applications import Starlette
+
+    app = create_app(settings=settings, query_client=FakeQueryClient())
+    assert type(app) is Starlette

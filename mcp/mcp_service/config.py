@@ -4,18 +4,45 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from pydantic import AnyHttpUrl, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from app import __version__
+from mcp_service import __version__
+
+_MCP_ROOT = Path(__file__).resolve().parent.parent
+_ENV_FILE = _MCP_ROOT / ".env"
+
+_LOCAL_HOSTS = (
+    "127.0.0.1",
+    "127.0.0.1:*",
+    "localhost",
+    "localhost:*",
+    "[::1]",
+    "[::1]:*",
+)
+_LOCAL_ORIGINS = (
+    "http://127.0.0.1",
+    "http://127.0.0.1:*",
+    "http://localhost",
+    "http://localhost:*",
+)
+
+
+def _with_port_wildcard(hosts: list[str]) -> list[str]:
+    out: list[str] = []
+    for host in hosts:
+        out.append(host)
+        if ":" not in host and not host.endswith(":*"):
+            out.append(f"{host}:*")
+    return list(dict.fromkeys(out))
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_ENV_FILE if _ENV_FILE.is_file() else None,
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -29,7 +56,6 @@ class Settings(BaseSettings):
     query_api_timeout_seconds: float = Field(default=20.0, alias="QUERY_API_TIMEOUT_SECONDS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
-    # Optional Host allowlist for MCP DNS-rebinding protection (comma-separated).
     mcp_allowed_hosts: str = Field(default="", alias="MCP_ALLOWED_HOSTS")
     mcp_allowed_origins: str = Field(default="", alias="MCP_ALLOWED_ORIGINS")
 
@@ -56,45 +82,30 @@ class Settings(BaseSettings):
         return str(self.query_api_base_url).rstrip("/")
 
     @property
-    def allowed_host_list(self) -> list[str]:
-        hosts = [
-            "127.0.0.1",
-            "127.0.0.1:*",
-            "localhost",
-            "localhost:*",
-            "[::1]",
-            "[::1]:*",
-        ]
+    def _explicit_hosts(self) -> list[str]:
         extra = [item.strip() for item in self.mcp_allowed_hosts.split(",") if item.strip()]
         railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
         if railway_domain:
             extra.append(railway_domain)
-        for host in extra:
-            hosts.append(host)
-            if ":" not in host and not host.endswith(":*"):
-                hosts.append(f"{host}:*")
-        return list(dict.fromkeys(hosts))
+        return extra
+
+    @property
+    def allowed_host_list(self) -> list[str]:
+        extra = self._explicit_hosts
+        if extra:
+            return _with_port_wildcard(extra)
+        return list(_LOCAL_HOSTS)
 
     @property
     def allowed_origin_list(self) -> list[str]:
-        origins = [
-            "http://127.0.0.1",
-            "http://127.0.0.1:*",
-            "http://localhost",
-            "http://localhost:*",
-        ]
+        extra = [item.strip() for item in self.mcp_allowed_origins.split(",") if item.strip()]
         railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
         if railway_domain:
-            origins.append(f"https://{railway_domain}")
-            origins.append(f"https://{railway_domain}:*")
-        extra = [item.strip() for item in self.mcp_allowed_origins.split(",") if item.strip()]
-        origins.extend(extra)
-        return list(dict.fromkeys(origins))
-
-
-def validate_query_api_base_url(url: str) -> bool:
-    parsed = urlparse(url)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+            extra.append(f"https://{railway_domain}")
+            extra.append(f"https://{railway_domain}:*")
+        if extra:
+            return list(dict.fromkeys(extra))
+        return list(_LOCAL_ORIGINS)
 
 
 @lru_cache

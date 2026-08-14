@@ -9,9 +9,10 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from app.logging import current_request_id, log_request
+from mcp_service.logging import current_request_id, log_request
 
 _PUBLIC_PATHS = frozenset({"/health", "/ready"})
+_MCP_PATHS = frozenset({"/mcp", "/mcp/"})
 
 
 def _unauthorized(request_id: str) -> JSONResponse:
@@ -55,9 +56,7 @@ class McpAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         path = request.url.path
-        if path in _PUBLIC_PATHS:
-            return await call_next(request)
-        if not path.startswith("/mcp"):
+        if path in _PUBLIC_PATHS or path not in _MCP_PATHS:
             return await call_next(request)
 
         request_id = str(getattr(request.state, "request_id", None) or current_request_id())
@@ -67,6 +66,7 @@ class McpAuthMiddleware(BaseHTTPMiddleware):
                 request_id=request_id,
                 category="mcp_auth",
                 http_status=401,
+                outcome="unauthorized",
                 principal="unauthenticated",
                 error_code="UNAUTHORIZED",
             )

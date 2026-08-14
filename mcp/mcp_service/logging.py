@@ -18,7 +18,6 @@ from starlette.responses import Response
 REQUEST_ID_HEADER = "X-Request-ID"
 
 request_id_ctx: ContextVar[str] = ContextVar("mcp_request_id", default="unknown")
-tool_name_ctx: ContextVar[str | None] = ContextVar("mcp_tool_name", default=None)
 
 logger = logging.getLogger("mcp_service")
 
@@ -75,6 +74,7 @@ def log_request(
     category: str,
     tool_name: str | None = None,
     http_status: int | None = None,
+    outcome: str | None = None,
     principal: str = "anonymous",
     start: str | None = None,
     end: str | None = None,
@@ -83,27 +83,30 @@ def log_request(
     bucket: str | None = None,
     record_count: int | None = None,
     truncated: bool | None = None,
-    upstream_outcome: str | None = None,
     latency_ms: float | None = None,
     error_code: str | None = None,
 ) -> None:
-    logger.info(
-        "mcp_access request_id=%s category=%s tool=%s status=%s principal=%s "
-        "start=%s end=%s timezone=%s resolution=%s bucket=%s "
-        "record_count=%s truncated=%s upstream_outcome=%s latency_ms=%s error_code=%s",
-        request_id,
-        category,
-        tool_name,
-        http_status,
-        principal,
-        start,
-        end,
-        timezone,
-        resolution,
-        bucket,
-        record_count,
-        truncated,
-        upstream_outcome,
-        f"{latency_ms:.1f}" if latency_ms is not None else None,
-        error_code,
+    parts = [
+        f"request_id={request_id}",
+        f"category={category}",
+        f"tool={tool_name}",
+        f"principal={principal}",
+    ]
+    if http_status is not None:
+        parts.append(f"http_status={http_status}")
+    if outcome is not None:
+        parts.append(f"outcome={outcome}")
+    parts.extend(
+        [
+            f"start={start}",
+            f"end={end}",
+            f"timezone={timezone}",
+            f"resolution={resolution}",
+            f"bucket={bucket}",
+            f"record_count={record_count}",
+            f"truncated={truncated}",
+            f"latency_ms={f'{latency_ms:.1f}' if latency_ms is not None else None}",
+            f"error_code={error_code}",
+        ]
     )
+    logger.info("mcp_access %s", " ".join(parts))

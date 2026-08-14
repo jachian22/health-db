@@ -33,6 +33,8 @@ Cursor:
 
 The MCP endpoint is the protocol path `/mcp` (POST, plus any GET the Streamable HTTP transport requires). There are no REST-shaped tool URLs such as `GET /mcp/get-meals`.
 
+The process is the official MCP Python SDK Starlette app (`MCPServer.streamable_http_app`). `/health` and `/ready` are SDK custom routes. Request IDs and bearer auth are Starlette middleware. Uvicorn serves that app directly. There is no parent FastAPI wrapper.
+
 ```text
 GET  /health   process liveness (no Query API, no auth)
 GET  /ready    configuration present + Query API /ready reachable (no auth)
@@ -139,7 +141,7 @@ Oversized raw glucose example:
 
 **Must never appear in logs:** `MCP_API_KEY`, `READ_API_KEY`, `INGEST_API_KEY`, `Authorization` headers, glucose values, meal foods, meal notes, source sample IDs, raw tool JSON, raw upstream bodies, database URLs, SQL, stack traces sent to callers.
 
-**Logged:** `request_id`, route/MCP method category, tool name, HTTP status, principal category (`mcp_caller` / `unauthenticated` / `probe`), requested start/end/timezone/resolution/bucket, returned count, truncated flag, upstream outcome category, `latency_ms`, safe error code.
+**Logged:** `request_id`, route/MCP method category, tool name, principal category (`mcp_caller` / `unauthenticated` / `probe`), requested start/end/timezone/resolution/bucket, returned count, truncated flag, outcome, `latency_ms`, safe error code. Real HTTP status is logged only for HTTP requests (`/mcp` auth, `/health`, `/ready`), not for JSON-RPC tool results.
 
 Errors include a `request_id` for Railway log lookup.
 
@@ -169,7 +171,7 @@ export QUERY_API_BASE_URL="http://127.0.0.1:8000"
 export READ_API_KEY="local-test-read-key"
 export MCP_API_KEY="local-test-mcp-key"
 
-uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8001
+uvicorn mcp_service.main:create_app --factory --host 0.0.0.0 --port 8001
 ```
 
 Checks:
@@ -223,7 +225,7 @@ openssl rand -hex 32
 
 Save it in a password manager. Do not commit it. Do not paste it into git, Dockerfiles, or this repo.
 
-Optional: Railway injects `RAILWAY_PUBLIC_DOMAIN`; the service allowlists that Host automatically.
+Optional: Railway injects `RAILWAY_PUBLIC_DOMAIN`; the service allowlists that Host automatically and does **not** allowlist localhost in that case.
 
 After deploy:
 

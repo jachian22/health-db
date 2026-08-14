@@ -12,13 +12,14 @@ from typing import Any
 import httpx
 from pydantic import ValidationError
 
-from app.config import Settings
-from app.errors import QueryAPIError
-from app.models import (
+from mcp_service.config import Settings
+from mcp_service.errors import QueryAPIError
+from mcp_service.models import (
     CoverageResponse,
     GlucoseSeriesResponse,
     GlucoseSummaryResponse,
     MealsResponse,
+    to_iso8601,
 )
 
 COVERAGE_PATH = "/v1/query/coverage"
@@ -33,13 +34,6 @@ _SAFE_RATE_LIMIT = "The health data service is rate-limiting requests"
 _SAFE_RESPONSE = "The health data service returned an unexpected response"
 
 
-def _iso(value: datetime) -> str:
-    text = value.isoformat()
-    if text.endswith("+00:00"):
-        return text[:-6] + "Z"
-    return text
-
-
 class HealthDBQueryAPIClient:
     def __init__(
         self,
@@ -47,38 +41,28 @@ class HealthDBQueryAPIClient:
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._settings = settings
-        self._client = http_client
-        self._owns_client = http_client is None
-
-    async def aclose(self) -> None:
-        if self._owns_client and self._client is not None:
-            await self._client.aclose()
-            self._client = None
-
-    async def _ensure_client(self) -> httpx.AsyncClient:
-        if self._client is None:
+        if http_client is None:
             self._client = httpx.AsyncClient(
                 base_url=self._settings.query_api_base_url_str,
                 timeout=self._settings.query_api_timeout_seconds,
-                headers={
-                    "Authorization": (
-                        f"Bearer {self._settings.read_api_key.get_secret_value()}"
-                    ),
-                    "Accept": "application/json",
-                },
+                headers={"Accept": "application/json"},
             )
             self._owns_client = True
-        return self._client
+        else:
+            self._client = http_client
+            self._owns_client = False
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
 
     async def check_ready(self) -> bool:
         """GET /ready on the Query API. Does not send READ_API_KEY or query health data."""
         try:
-            async with httpx.AsyncClient(
-                base_url=self._settings.query_api_base_url_str,
-                timeout=min(5.0, self._settings.query_api_timeout_seconds),
-                headers={"Accept": "application/json"},
-            ) as probe:
-                response = await probe.get(READY_PATH)
+            request = self._client.build_request("GET", READY_PATH)
+            if "authorization" in request.headers:
+                del request.headers["authorization"]
+            response = await self._client.send(request)
         except httpx.RequestError:
             return False
         return response.status_code == 200
@@ -92,7 +76,7 @@ class HealthDBQueryAPIClient:
     ) -> CoverageResponse:
         data = await self._request(
             COVERAGE_PATH,
-            {"start": _iso(start), "end": _iso(end), "timezone": timezone},
+            {"start": to_iso8601(start), "end": to_iso8601(end), "timezone": timezone},
         )
         return self._parse(CoverageResponse, data)
 
@@ -107,8 +91,8 @@ class HealthDBQueryAPIClient:
         data = await self._request(
             GLUCOSE_SERIES_PATH,
             {
-                "start": _iso(start),
-                "end": _iso(end),
+                "start": to_iso8601(start),
+                "end": to_iso8601(end),
                 "resolution": resolution,
                 "timezone": timezone,
             },
@@ -126,8 +110,8 @@ class HealthDBQueryAPIClient:
         data = await self._request(
             GLUCOSE_SUMMARY_PATH,
             {
-                "start": _iso(start),
-                "end": _iso(end),
+                "start": to_iso8601(start),
+                "end": to_iso8601(end),
                 "bucket": bucket,
                 "timezone": timezone,
             },
@@ -144,8 +128,8 @@ class HealthDBQueryAPIClient:
         cursor: str | None = None,
     ) -> MealsResponse:
         params: dict[str, str | int] = {
-            "start": _iso(start),
-            "end": _iso(end),
+            "start": to_iso8601(start),
+            "end": to_iso8601(end),
             "timezone": timezone,
             "limit": limit,
         }
@@ -161,9 +145,16 @@ class HealthDBQueryAPIClient:
             raise QueryAPIError(code="UPSTREAM_RESPONSE_ERROR", message=_SAFE_RESPONSE) from exc
 
     async def _request(self, path: str, params: dict[str, str | int]) -> dict[str, Any]:
-        client = await self._ensure_client()
         try:
-            response = await client.get(path, params=params)
+            response = await self._client.get(
+                path,
+                params=params,
+                headers={
+                    "Authorization": (
+                        f"Bearer {self._settings.read_api_key.get_secret_value()}"
+                    )
+                },
+            )
         except httpx.TimeoutException as exc:
             raise QueryAPIError(code="UPSTREAM_TIMEOUT", message=_SAFE_TIMEOUT) from exc
         except httpx.RequestError as exc:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -13,7 +14,7 @@ class ToolError(Exception):
         self.message = message
         self.extra = extra
         payload = {"code": code, "message": message, **extra}
-        super().__init__(_encode(payload))
+        super().__init__(json.dumps(payload, default=str, separators=(",", ":")))
 
     def as_dict(self) -> dict[str, Any]:
         return {"code": self.code, "message": self.message, **self.extra}
@@ -33,9 +34,3 @@ class QueryAPIError(Exception):
         if request_id:
             extra.setdefault("request_id", request_id)
         return ToolError(self.code, self.message, **extra)
-
-
-def _encode(payload: dict[str, Any]) -> str:
-    import json
-
-    return json.dumps(payload, default=str, separators=(",", ":"))

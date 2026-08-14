@@ -12,10 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
-COPY app ./app
+COPY mcp_service ./mcp_service
 
 RUN pip install --upgrade pip && pip install .
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "echo starting health-db-mcp on 0.0.0.0:${PORT:-8000} && exec uvicorn app.main:create_app --factory --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "echo starting health-db-mcp on 0.0.0.0:${PORT:-8000} && exec uvicorn mcp_service.main:create_app --factory --host 0.0.0.0 --port ${PORT:-8000}"]

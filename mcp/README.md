@@ -16,7 +16,7 @@ export QUERY_API_BASE_URL="http://127.0.0.1:8000"
 export READ_API_KEY="local-test-read-key"
 export MCP_API_KEY="local-test-mcp-key"
 
-uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8001
+uvicorn mcp_service.main:create_app --factory --host 0.0.0.0 --port 8001
 ```
 
 The existing Query API must already be running on port 8000 with the same `READ_API_KEY`.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -17,10 +18,10 @@ os.environ["QUERY_API_BASE_URL"] = "http://query-api.test"
 os.environ.setdefault("LOG_LEVEL", "INFO")
 os.environ["INGEST_API_KEY"] = "test-ingest-key"
 
-from app.config import Settings  # noqa: E402
-from app.errors import QueryAPIError  # noqa: E402
-from app.main import create_app  # noqa: E402
-from app.models import (  # noqa: E402
+from mcp_service.config import Settings  # noqa: E402
+from mcp_service.errors import QueryAPIError  # noqa: E402
+from mcp_service.main import create_app  # noqa: E402
+from mcp_service.models import (  # noqa: E402
     CoverageCategory,
     CoverageMap,
     CoverageResponse,
@@ -31,7 +32,7 @@ from app.models import (  # noqa: E402
     MealItem,
     MealsResponse,
 )
-from app.tools import build_mcp_server  # noqa: E402
+from mcp_service.tools import build_mcp_server  # noqa: E402
 
 TEST_MCP_KEY = "test-mcp-key"
 TEST_READ_KEY = "test-read-key"
@@ -175,13 +176,13 @@ class FakeQueryClient:
         self.calls.append(("glucose_series", kwargs))
         if self.error:
             raise self.error
-        return self.series
+        return self.series.model_copy(update={"resolution": kwargs["resolution"]})
 
     async def get_glucose_summary(self, **kwargs: Any) -> GlucoseSummaryResponse:
         self.calls.append(("glucose_summary", kwargs))
         if self.error:
             raise self.error
-        return self.summary
+        return self.summary.model_copy(update={"bucket": kwargs["bucket"]})
 
     async def get_meals(self, **kwargs: Any) -> MealsResponse:
         self.calls.append(("meals", kwargs))
@@ -228,3 +229,16 @@ def assert_no_secrets(text: str) -> None:
 
 def query_error(code: str, message: str, **extra: Any) -> QueryAPIError:
     return QueryAPIError(code=code, message=message, **extra)
+
+
+def parse_mcp_http_body(response) -> dict[str, Any]:
+    """Parse a Streamable HTTP JSON or SSE JSON-RPC body."""
+    content_type = (response.headers.get("content-type") or "").lower()
+    if "text/event-stream" in content_type:
+        for line in response.text.splitlines():
+            if line.startswith("data:"):
+                data = line[5:].strip()
+                if data and data != "[DONE]":
+                    return json.loads(data)
+        raise AssertionError(f"no SSE JSON-RPC payload in {response.text!r}")
+    return response.json()

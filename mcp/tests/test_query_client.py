@@ -9,15 +9,16 @@ import httpx
 import pytest
 from mcp import Client
 
-from app.errors import QueryAPIError
-from app.query_api_client import (
+from mcp_service.errors import QueryAPIError
+from mcp_service.query_api_client import (
     COVERAGE_PATH,
     GLUCOSE_SERIES_PATH,
     GLUCOSE_SUMMARY_PATH,
     MEALS_PATH,
+    READY_PATH,
     HealthDBQueryAPIClient,
 )
-from app.tools import build_mcp_server
+from mcp_service.tools import build_mcp_server
 from tests.conftest import (
     TEST_READ_KEY,
     FakeQueryClient,
@@ -275,3 +276,19 @@ async def test_malformed_upstream_schema():
     assert raised.value.code == "UPSTREAM_RESPONSE_ERROR"
     assert "Field required" not in raised.value.message
     assert TEST_READ_KEY not in raised.value.message
+
+
+@pytest.mark.asyncio
+async def test_check_ready_does_not_send_read_key():
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"status": "ok"})
+
+    client = _client_for(handler)
+    ok = await client.check_ready()
+    await client.aclose()
+    assert ok is True
+    assert seen[0].url.path == READY_PATH
+    assert "authorization" not in seen[0].headers

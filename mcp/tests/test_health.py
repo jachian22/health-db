@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from starlette.testclient import TestClient
 
-from app.main import create_app
+from mcp_service.main import create_app
 from tests.conftest import TEST_READ_KEY, FakeQueryClient, assert_no_secrets, make_settings
 
 
@@ -56,7 +56,7 @@ def test_missing_required_settings_fail_fast(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("QUERY_API_BASE_URL", raising=False)
     from pydantic import ValidationError
 
-    from app.config import Settings
+    from mcp_service.config import Settings
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
