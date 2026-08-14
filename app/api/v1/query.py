@@ -4,7 +4,7 @@ All endpoints require Authorization: Bearer <READ_API_KEY>, explicit bounded
 time ranges, and return UTC source timestamps. Timezone is used only for
 local-calendar aggregation/labels (default America/New_York).
 
-Resource protection is application-level only: hard date-range limits, meal page
+Resource protection is application-level only: hard date-range limits, list page
 size, glucose point ceilings, and Postgres statement_timeout on read queries.
 There is no in-process rate limiter; rely on those caps (and platform limits).
 """
@@ -20,7 +20,14 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, Request
 
 from app.api.dependencies import DbSession
-from app.core import DEFAULT_MEAL_LIMIT, DEFAULT_QUERY_TIMEZONE, MAX_MEAL_LIMIT
+from app.core import (
+    DEFAULT_PAGE_LIMIT,
+    DEFAULT_QUERY_TIMEZONE,
+    MAX_PAGE_LIMIT,
+    MAX_SLEEP_RANGE_DAYS,
+    MAX_WEIGHT_RANGE_DAYS,
+    MAX_WORKOUT_RANGE_DAYS,
+)
 from app.core.errors import AppError, ErrorResponse
 from app.core.security import require_read_auth
 from app.schemas.responses import (
@@ -28,6 +35,10 @@ from app.schemas.responses import (
     GlucoseSeriesResponse,
     GlucoseSummaryResponse,
     MealsResponse,
+    PagedResponse,
+    SleepIntervalsResponse,
+    WeightMeasurementsResponse,
+    WorkoutsResponse,
 )
 from app.services.query_service import HealthDataQueryService
 
@@ -224,16 +235,59 @@ async def _execute[T](
         ) from exc
 
 
+ListStart = Annotated[
+    datetime, Query(description="Inclusive range start (ISO-8601 with timezone)")
+]
+ListEnd = Annotated[
+    datetime, Query(description="Exclusive range end (ISO-8601 with timezone)")
+]
+ListTimezone = Annotated[
+    str,
+    Query(description=f"IANA timezone (default {DEFAULT_QUERY_TIMEZONE})"),
+]
+ListLimit = Annotated[
+    int | None,
+    Query(description=f"Page size (default {DEFAULT_PAGE_LIMIT}, max {MAX_PAGE_LIMIT})"),
+]
+ListCursor = Annotated[
+    str | None,
+    Query(description="HMAC-signed pagination cursor from a prior next_cursor"),
+]
+
+
+def _paged_success(
+    result: PagedResponse[object],
+) -> tuple[datetime, datetime, str, int | None, bool | None, str | None, str | None]:
+    return (
+        result.start,
+        result.end,
+        result.timezone,
+        result.record_count,
+        result.truncated,
+        None,
+        None,
+    )
+
+
+async def _execute_paged[T](request: Request, route: str, coro: Awaitable[T]) -> T:
+    return await _execute(request, route, coro, on_success=_paged_success)
+
+
 @router.get(
     "/coverage",
     response_model=CoverageResponse,
     summary="Dataset coverage for a bounded window",
     description=(
         "Read-only discovery endpoint. Reports whether glucose, meals, workouts, "
-        "sleep_intervals, and weight_measurements exist in the half-open "
+        "sleep_intervals, and weight_measurements exist in a bounded half-open "
         "`[start, end)` window for the fixed personal principal.\n\n"
-        "All query endpoints are read-only and require explicit bounded time ranges.\n\n"
-        "Empty categories return `count: 0` with null `first_at` / `last_at`."
+        "Workouts and sleep_intervals use interval overlap "
+        "(`start_time < end AND end_time > start`). "
+        "`first_at` / `last_at` are min/max stored `start_time` among included records.\n\n"
+        "Glucose, meals, and weight_measurements count timestamps in `[start, end)` "
+        "(`sample_time`, `meal_completed_at`, `measured_at`).\n\n"
+        "Empty categories return `count: 0` with null `first_at` / `last_at`. "
+        "Raw record counts only; no medical advice or clinical interpretation."
     ),
     responses=_ERROR_RESPONSES,
     response_model_exclude_none=False,
@@ -424,14 +478,12 @@ async def get_glucose_summary(
     summary="Meal events (foods, no notes)",
     description=(
         "Read-only meal list over `[start, end)` by `meal_completed_at` "
-        "(ascending), including historical/backfilled meals.\n\n"
-        "All query endpoints are read-only and require explicit bounded time ranges.\n\n"
-        "Authenticated callers receive food strings. Notes, metadata, database "
-        "primary keys, and internal source catalog IDs are never returned. "
-        "Public `id` is the stable `source_sample_id`.\n\n"
-        f"Pagination: default `limit={DEFAULT_MEAL_LIMIT}`, maximum "
-        f"`limit={MAX_MEAL_LIMIT}`. When truncated, `truncated=true` and a "
-        "HMAC-signed `next_cursor` (bound to the request range) are set."
+        "(ascending), including historical/backfilled meals. "
+        "Public `id` is `source_sample_id`. Notes and metadata are never returned. "
+        "Raw records only; no medical advice or clinical interpretation.\n\n"
+        f"Pagination: default `limit={DEFAULT_PAGE_LIMIT}`, maximum "
+        f"`limit={MAX_PAGE_LIMIT}`. HMAC-signed `next_cursor` is bound to the "
+        "request range."
     ),
     responses={
         **_ERROR_RESPONSES,
@@ -465,27 +517,14 @@ async def get_glucose_summary(
 async def get_meals(
     request: Request,
     db: DbSession,
-    start: Annotated[
-        datetime, Query(description="Inclusive range start (ISO-8601 with timezone)")
-    ],
-    end: Annotated[
-        datetime, Query(description="Exclusive range end (ISO-8601 with timezone)")
-    ],
-    timezone: Annotated[
-        str,
-        Query(description=f"IANA timezone (default {DEFAULT_QUERY_TIMEZONE})"),
-    ] = DEFAULT_QUERY_TIMEZONE,
-    limit: Annotated[
-        int | None,
-        Query(description=f"Page size (default {DEFAULT_MEAL_LIMIT}, max {MAX_MEAL_LIMIT})"),
-    ] = None,
-    cursor: Annotated[
-        str | None,
-        Query(description="HMAC-signed pagination cursor from a prior next_cursor"),
-    ] = None,
+    start: ListStart,
+    end: ListEnd,
+    timezone: ListTimezone = DEFAULT_QUERY_TIMEZONE,
+    limit: ListLimit = None,
+    cursor: ListCursor = None,
 ) -> MealsResponse:
     service = HealthDataQueryService(db)
-    return await _execute(
+    return await _execute_paged(
         request,
         "/v1/query/meals",
         service.meals(
@@ -496,13 +535,127 @@ async def get_meals(
             limit=limit,
             cursor=cursor,
         ),
-        on_success=lambda r: (
-            r.start,
-            r.end,
-            r.timezone,
-            r.record_count,
-            r.truncated,
-            None,
-            None,
+    )
+
+
+@router.get(
+    "/workouts",
+    response_model=WorkoutsResponse,
+    summary="Workout intervals overlapping a bounded window",
+    description=(
+        "Read-only workout list. Included when the interval overlaps "
+        "`[start, end)`: `start_time < end AND end_time > start`. "
+        "Returned timestamps are unclipped stored UTC instants. "
+        f"Maximum window: {MAX_WORKOUT_RANGE_DAYS} days. "
+        "Public `id` is `source_sample_id`. `duration_minutes` is derived; "
+        "`distance_meters` may be null. Heart rate, energy, and metadata are "
+        "never returned. Raw records only; no medical advice or clinical "
+        "interpretation.\n\n"
+        f"Pagination: default `limit={DEFAULT_PAGE_LIMIT}`, maximum "
+        f"`limit={MAX_PAGE_LIMIT}`. HMAC-signed `next_cursor` is bound to the "
+        "request range."
+    ),
+    responses=_ERROR_RESPONSES,
+)
+async def get_workouts(
+    request: Request,
+    db: DbSession,
+    start: ListStart,
+    end: ListEnd,
+    timezone: ListTimezone = DEFAULT_QUERY_TIMEZONE,
+    limit: ListLimit = None,
+    cursor: ListCursor = None,
+) -> WorkoutsResponse:
+    service = HealthDataQueryService(db)
+    return await _execute_paged(
+        request,
+        "/v1/query/workouts",
+        service.workouts(
+            request_id=_request_id(request),
+            start=start,
+            end=end,
+            timezone=timezone,
+            limit=limit,
+            cursor=cursor,
+        ),
+    )
+
+
+@router.get(
+    "/sleep-intervals",
+    response_model=SleepIntervalsResponse,
+    summary="Raw sleep intervals overlapping a bounded window",
+    description=(
+        "Read-only raw sleep intervals. Included when the interval overlaps "
+        "`[start, end)`: `start_time < end AND end_time > start`. "
+        "Timestamps are unclipped; stages are stored strings (not remapped or "
+        f"sessionized). Maximum window: {MAX_SLEEP_RANGE_DAYS} days. "
+        "Public `id` is `source_sample_id`. Raw records only; no medical advice "
+        "or clinical interpretation.\n\n"
+        f"Pagination: default `limit={DEFAULT_PAGE_LIMIT}`, maximum "
+        f"`limit={MAX_PAGE_LIMIT}`. HMAC-signed `next_cursor` is bound to the "
+        "request range."
+    ),
+    responses=_ERROR_RESPONSES,
+)
+async def get_sleep_intervals(
+    request: Request,
+    db: DbSession,
+    start: ListStart,
+    end: ListEnd,
+    timezone: ListTimezone = DEFAULT_QUERY_TIMEZONE,
+    limit: ListLimit = None,
+    cursor: ListCursor = None,
+) -> SleepIntervalsResponse:
+    service = HealthDataQueryService(db)
+    return await _execute_paged(
+        request,
+        "/v1/query/sleep-intervals",
+        service.sleep_intervals(
+            request_id=_request_id(request),
+            start=start,
+            end=end,
+            timezone=timezone,
+            limit=limit,
+            cursor=cursor,
+        ),
+    )
+
+
+@router.get(
+    "/weight-measurements",
+    response_model=WeightMeasurementsResponse,
+    summary="Weight measurements in a bounded window",
+    description=(
+        "Read-only weight measurements in `[start, end)` by `measured_at`. "
+        f"Maximum window: {MAX_WEIGHT_RANGE_DAYS} days. "
+        "Public `id` is `source_sample_id`. Values are kilograms (`value_kg`). "
+        "Raw records only; no medical advice or clinical interpretation.\n\n"
+        f"Pagination: default `limit={DEFAULT_PAGE_LIMIT}`, maximum "
+        f"`limit={MAX_PAGE_LIMIT}`. HMAC-signed `next_cursor` is bound to the "
+        "request range."
+    ),
+    responses=_ERROR_RESPONSES,
+)
+async def get_weight_measurements(
+    request: Request,
+    db: DbSession,
+    start: ListStart,
+    end: ListEnd,
+    timezone: ListTimezone = DEFAULT_QUERY_TIMEZONE,
+    limit: ListLimit = None,
+    cursor: ListCursor = None,
+) -> WeightMeasurementsResponse:
+    service = HealthDataQueryService(db)
+    return await _execute_paged(
+        request,
+        "/v1/query/weight-measurements",
+        service.weight_measurements(
+            request_id=_request_id(request),
+            start=start,
+            end=end,
+            timezone=timezone,
+            limit=limit,
+            cursor=cursor,
         ),
     )

@@ -18,6 +18,9 @@ async def test_openapi_documents_query_api_v1(client: AsyncClient):
     assert "/v1/query/glucose/series" in paths
     assert "/v1/query/glucose/summary" in paths
     assert "/v1/query/meals" in paths
+    assert "/v1/query/workouts" in paths
+    assert "/v1/query/sleep-intervals" in paths
+    assert "/v1/query/weight-measurements" in paths
     assert "/health" in paths
     assert "/ready" in paths
 
@@ -39,6 +42,9 @@ async def test_openapi_documents_query_api_v1(client: AsyncClient):
     assert "post" not in paths["/v1/query/coverage"]
     assert "read-only" in coverage["description"].lower()
     assert "bounded" in coverage["description"].lower()
+    assert "overlap" in coverage["description"].lower()
+    assert "start_time < end" in coverage["description"]
+    assert "may differ" not in coverage["description"].lower()
 
     glucose = paths["/v1/query/glucose/series"]["get"]
     assert "7 days" in glucose["description"]
@@ -48,6 +54,20 @@ async def test_openapi_documents_query_api_v1(client: AsyncClient):
     meals = paths["/v1/query/meals"]["get"]
     assert "notes" in meals["description"].lower()
     assert "hmac" in meals["description"].lower()
+
+    workouts = paths["/v1/query/workouts"]["get"]
+    assert "post" not in paths["/v1/query/workouts"]
+    assert "365" in workouts["description"]
+    assert "overlap" in workouts["description"].lower()
+    assert "may differ" not in workouts["description"].lower()
+
+    sleep = paths["/v1/query/sleep-intervals"]["get"]
+    assert "90" in sleep["description"]
+    assert "session" in sleep["description"].lower() or "raw" in sleep["description"].lower()
+
+    weight = paths["/v1/query/weight-measurements"]["get"]
+    assert "365" in weight["description"]
+    assert "kg" in weight["description"].lower()
 
     # Error schema exists
     schemas = spec["components"]["schemas"]

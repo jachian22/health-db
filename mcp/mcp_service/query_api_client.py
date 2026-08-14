@@ -19,6 +19,9 @@ from mcp_service.models import (
     GlucoseSeriesResponse,
     GlucoseSummaryResponse,
     MealsResponse,
+    SleepIntervalsResponse,
+    WeightMeasurementsResponse,
+    WorkoutsResponse,
     to_iso8601,
 )
 
@@ -26,6 +29,9 @@ COVERAGE_PATH = "/v1/query/coverage"
 GLUCOSE_SERIES_PATH = "/v1/query/glucose/series"
 GLUCOSE_SUMMARY_PATH = "/v1/query/glucose/summary"
 MEALS_PATH = "/v1/query/meals"
+WORKOUTS_PATH = "/v1/query/workouts"
+SLEEP_INTERVALS_PATH = "/v1/query/sleep-intervals"
+WEIGHT_MEASUREMENTS_PATH = "/v1/query/weight-measurements"
 READY_PATH = "/ready"
 
 _SAFE_UNAVAILABLE = "The health data service is unavailable"
@@ -127,6 +133,84 @@ class HealthDBQueryAPIClient:
         limit: int,
         cursor: str | None = None,
     ) -> MealsResponse:
+        return await self._get_paged(
+            MEALS_PATH,
+            MealsResponse,
+            start=start,
+            end=end,
+            timezone=timezone,
+            limit=limit,
+            cursor=cursor,
+        )
+
+    async def get_workouts(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        timezone: str,
+        limit: int,
+        cursor: str | None = None,
+    ) -> WorkoutsResponse:
+        return await self._get_paged(
+            WORKOUTS_PATH,
+            WorkoutsResponse,
+            start=start,
+            end=end,
+            timezone=timezone,
+            limit=limit,
+            cursor=cursor,
+        )
+
+    async def get_sleep_intervals(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        timezone: str,
+        limit: int,
+        cursor: str | None = None,
+    ) -> SleepIntervalsResponse:
+        return await self._get_paged(
+            SLEEP_INTERVALS_PATH,
+            SleepIntervalsResponse,
+            start=start,
+            end=end,
+            timezone=timezone,
+            limit=limit,
+            cursor=cursor,
+        )
+
+    async def get_weight_measurements(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        timezone: str,
+        limit: int,
+        cursor: str | None = None,
+    ) -> WeightMeasurementsResponse:
+        return await self._get_paged(
+            WEIGHT_MEASUREMENTS_PATH,
+            WeightMeasurementsResponse,
+            start=start,
+            end=end,
+            timezone=timezone,
+            limit=limit,
+            cursor=cursor,
+        )
+
+    async def _get_paged[T](
+        self,
+        path: str,
+        model: type[T],
+        *,
+        start: datetime,
+        end: datetime,
+        timezone: str,
+        limit: int,
+        cursor: str | None = None,
+    ) -> T:
         params: dict[str, str | int] = {
             "start": to_iso8601(start),
             "end": to_iso8601(end),
@@ -135,8 +219,8 @@ class HealthDBQueryAPIClient:
         }
         if cursor is not None:
             params["cursor"] = cursor
-        data = await self._request(MEALS_PATH, params)
-        return self._parse(MealsResponse, data)
+        data = await self._request(path, params)
+        return self._parse(model, data)
 
     def _parse[T](self, model: type[T], data: dict[str, Any]) -> T:
         try:

@@ -89,9 +89,9 @@ QUERY_API_BASE_URL=https://health-db-production.up.railway.app
 
 Missing required settings fail fast at process start. Secret values are never printed.
 
-## Initial tools
+## Tools
 
-Exactly four read-only tools. Each maps to one Query API route.
+Seven read-only tools. Each maps to one Query API route.
 
 | MCP tool | Query API | Purpose |
 |---|---|---|
@@ -99,14 +99,19 @@ Exactly four read-only tools. Each maps to one Query API route.
 | `get_glucose_series` | `GET /v1/query/glucose/series` | Bounded raw or aggregated glucose |
 | `get_glucose_summary` | `GET /v1/query/glucose/summary` | Descriptive stats without the full series |
 | `get_meals` | `GET /v1/query/meals` | Meal events with foods; notes excluded |
+| `get_workouts` | `GET /v1/query/workouts` | Workout intervals overlapping the window |
+| `get_sleep_intervals` | `GET /v1/query/sleep-intervals` | Raw sleep intervals overlapping the window |
+| `get_weight_measurements` | `GET /v1/query/weight-measurements` | Weight measurements in `[start, end)` |
 
 Typical agent workflow:
 
 ```text
-get_data_coverage → get_meals → get_glucose_series → get_glucose_summary
+get_data_coverage → get_meals / get_workouts / get_sleep_intervals / get_weight_measurements → get_glucose_series → get_glucose_summary
 ```
 
-Shared inputs: timezone-aware ISO-8601 `start` / `end` (half-open `[start, end)`). Optional `timezone` defaults to `America/New_York`.
+Shared inputs: timezone-aware ISO-8601 `start` / `end` (half-open `[start, end)`). Optional `timezone` defaults to `America/New_York`. List tools accept `limit` (default 100, max 500) and an opaque `cursor`.
+
+Workouts and sleep intervals use **interval overlap** for both `get_data_coverage` and the list tools: `start_time < end AND end_time > start`. Coverage `first_at` / `last_at` are min/max stored `start_time` among included records. Glucose, meals, and weight count timestamps in `[start, end)` (`sample_time`, `meal_completed_at`, `measured_at`).
 
 ### Tool input limits
 
@@ -122,8 +127,11 @@ These are enforced in the MCP service for actionable errors. The Query API still
 | `15m` span | maximum 90 days |
 | `hourly` span | maximum 365 days |
 | Summary `bucket` | `overall` \| `daily` (default `overall`) |
-| Meal `limit` | default 100, minimum 1, maximum 500 |
-| Meal `cursor` | opaque string; passed through unchanged |
+| List `limit` | default 100, minimum 1, maximum 500 |
+| List `cursor` | opaque string; passed through unchanged |
+| Workout window | maximum 365 days; overlap inclusion |
+| Sleep-interval window | maximum 90 days; overlap inclusion; raw intervals, not sessions |
+| Weight window | maximum 365 days; `start <= measured_at < end` |
 
 Oversized raw glucose example:
 
@@ -137,9 +145,9 @@ Oversized raw glucose example:
 
 ## Privacy rules
 
-**May appear in authenticated tool results:** glucose values, food strings, timestamps, bounded result data, pagination cursors, freshness metadata.
+**May appear in authenticated tool results:** glucose values, food strings, workout sport/distance/duration, raw sleep stages, weight kilograms, timestamps, bounded result data, pagination cursors, freshness metadata.
 
-**Must never appear in logs:** `MCP_API_KEY`, `READ_API_KEY`, `INGEST_API_KEY`, `Authorization` headers, glucose values, meal foods, meal notes, source sample IDs, raw tool JSON, raw upstream bodies, database URLs, SQL, stack traces sent to callers.
+**Must never appear in logs:** `MCP_API_KEY`, `READ_API_KEY`, `INGEST_API_KEY`, `Authorization` headers, glucose values, meal foods, meal notes, sleep stages, weight values, workout heart rate/energy, source sample IDs, raw tool JSON, raw upstream bodies, database URLs, SQL, stack traces sent to callers.
 
 **Logged:** `request_id`, route/MCP method category, tool name, principal category (`mcp_caller` / `unauthenticated` / `probe`), requested start/end/timezone/resolution/bucket, returned count, truncated flag, outcome, `latency_ms`, safe error code. Real HTTP status is logged only for HTTP requests (`/mcp` auth, `/health`, `/ready`), not for JSON-RPC tool results.
 
@@ -241,7 +249,7 @@ curl -i -X POST https://YOUR-MCP-RAILWAY-DOMAIN/mcp \
   -H "Content-Type: application/json" --data '{}'
 ```
 
-Then use an MCP client/inspector with the real `MCP_API_KEY` against `https://YOUR-MCP-RAILWAY-DOMAIN/mcp` to list tools and call all four. Confirm Railway logs show request IDs, tool names, and latency — not health values, foods, notes, secrets, or raw payloads.
+Then use an MCP client/inspector with the real `MCP_API_KEY` against `https://YOUR-MCP-RAILWAY-DOMAIN/mcp` to list tools and call all seven. Confirm Railway logs show request IDs, tool names, and latency — not health values, foods, notes, sleep stages, weight kilograms, secrets, or raw payloads.
 
 ## Cursor configuration
 
@@ -279,13 +287,16 @@ get_data_coverage
 get_glucose_series
 get_glucose_summary
 get_meals
+get_workouts
+get_sleep_intervals
+get_weight_measurements
 ```
 
 Bounded smoke workflow (describe available data only; do not make medical claims):
 
 ```text
 Use get_data_coverage for 2026-08-01 through 2026-08-12.
-Then retrieve meals for the same window.
+Then retrieve meals, workouts, sleep intervals, and weight measurements for the same window.
 Then retrieve 15-minute glucose data for the same window.
 Then retrieve an overall glucose summary.
 Describe the available data only; do not make medical claims.
@@ -316,4 +327,4 @@ SDK caveat: the 2026-07-28 protocol is sessionless by construction. `stateless_h
 
 ## Intentionally deferred
 
-OAuth 2.1 / dynamic client registration, multi-user authorization, public third-party MCP access, MCP resources/prompts, chart/report generation, workout/sleep/weight tools, database access from MCP, write/delete tools, MCP session persistence, and HTTP `QUERY` method transport.
+OAuth 2.1 / dynamic client registration, multi-user authorization, public third-party MCP access, MCP resources/prompts, chart/report generation, database access from MCP, write/delete tools, MCP session persistence, and HTTP `QUERY` method transport.

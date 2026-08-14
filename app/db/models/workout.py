@@ -34,6 +34,9 @@ class Workout(IngestedTimestampMixin, Base):
         ),
         Index("ix_workouts_user_id_start_time", "user_id", "start_time"),
         Index("ix_workouts_user_id_sport_start_time", "user_id", "sport", "start_time"),
+        # Overlap queries also filter end_time. Do not add
+        # ix_workouts_user_id_end_time until EXPLAIN (ANALYZE, BUFFERS)
+        # after deploy shows the current plan or measured latency needs it.
         CheckConstraint("end_time > start_time", name="end_after_start"),
         CheckConstraint(
             "distance_meters IS NULL OR distance_meters >= 0",

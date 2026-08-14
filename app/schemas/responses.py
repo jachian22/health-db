@@ -107,16 +107,7 @@ class GlucoseSummaryResponse(BaseModel):
     days: list[GlucoseDailySummary] | None = None
 
 
-class MealItem(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    meal_completed_at: datetime
-    foods: list[str]
-    source: str
-
-
-class MealsResponse(BaseModel):
+class PagedResponse[TItem](BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     request_id: str
@@ -127,4 +118,61 @@ class MealsResponse(BaseModel):
     truncated: bool = False
     next_cursor: str | None = None
     data_fresh_through: datetime | None = None
-    items: list[MealItem] = Field(default_factory=list)
+    items: list[TItem] = Field(default_factory=list)
+
+
+class MealItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    meal_completed_at: datetime
+    foods: list[str]
+    source: str
+
+
+class MealsResponse(PagedResponse[MealItem]):
+    pass
+
+
+class WorkoutItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    start_time: datetime
+    end_time: datetime
+    sport: str
+    distance_meters: float | None = None
+    duration_minutes: float
+    source: str
+
+
+class WorkoutsResponse(PagedResponse[WorkoutItem]):
+    pass
+
+
+class SleepIntervalItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    start_time: datetime
+    end_time: datetime
+    duration_minutes: float
+    stage: str
+    source: str
+
+
+class SleepIntervalsResponse(PagedResponse[SleepIntervalItem]):
+    pass
+
+
+class WeightMeasurementItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    measured_at: datetime
+    value_kg: float
+    source: str
+
+
+class WeightMeasurementsResponse(PagedResponse[WeightMeasurementItem]):
+    pass

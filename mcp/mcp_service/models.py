@@ -9,9 +9,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, ConfigDict, Field
 
 from mcp_service.constants import (
-    DEFAULT_MEAL_LIMIT,
+    DEFAULT_PAGE_LIMIT,
     DEFAULT_QUERY_TIMEZONE,
-    MAX_MEAL_LIMIT,
+    MAX_PAGE_LIMIT,
     RESOLUTION_LABELS,
     RESOLUTION_MAX_DAYS,
 )
@@ -103,14 +103,7 @@ class GlucoseSummaryResponse(QueryModel):
     days: list[GlucoseDailySummary] | None = None
 
 
-class MealItem(QueryModel):
-    id: str
-    meal_completed_at: datetime
-    foods: list[str]
-    source: str
-
-
-class MealsResponse(QueryModel):
+class PagedResponse[TItem](QueryModel):
     request_id: str
     start: datetime
     end: datetime
@@ -119,7 +112,56 @@ class MealsResponse(QueryModel):
     truncated: bool = False
     next_cursor: str | None = None
     data_fresh_through: datetime | None = None
-    items: list[MealItem] = Field(default_factory=list)
+    items: list[TItem] = Field(default_factory=list)
+
+
+class MealItem(QueryModel):
+    id: str
+    meal_completed_at: datetime
+    foods: list[str]
+    source: str
+
+
+class MealsResponse(PagedResponse[MealItem]):
+    pass
+
+
+class WorkoutItem(QueryModel):
+    id: str
+    start_time: datetime
+    end_time: datetime
+    sport: str
+    distance_meters: float | None = None
+    duration_minutes: float
+    source: str
+
+
+class WorkoutsResponse(PagedResponse[WorkoutItem]):
+    pass
+
+
+class SleepIntervalItem(QueryModel):
+    id: str
+    start_time: datetime
+    end_time: datetime
+    duration_minutes: float
+    stage: str
+    source: str
+
+
+class SleepIntervalsResponse(PagedResponse[SleepIntervalItem]):
+    pass
+
+
+class WeightMeasurementItem(QueryModel):
+    id: str
+    measured_at: datetime
+    value_kg: float
+    source: str
+
+
+class WeightMeasurementsResponse(PagedResponse[WeightMeasurementItem]):
+    pass
 
 
 def to_iso8601(value: datetime) -> str:
@@ -174,19 +216,34 @@ def enforce_glucose_range_limit(start: datetime, end: datetime, resolution: str)
         )
 
 
-def validate_meal_limit(limit: int | None) -> int:
+def enforce_max_range_days(
+    start: datetime,
+    end: datetime,
+    *,
+    max_days: int,
+    label: str,
+) -> None:
+    if end - start > timedelta(days=max_days):
+        raise ToolError(
+            code="RANGE_TOO_LARGE",
+            message=f"{label} queries are limited to {max_days} days",
+            max_days=max_days,
+        )
+
+
+def validate_page_limit(limit: int | None) -> int:
     if limit is None:
-        return DEFAULT_MEAL_LIMIT
+        return DEFAULT_PAGE_LIMIT
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ToolError(
             code="INVALID_LIMIT",
             message="limit must be a positive integer",
         )
-    if limit > MAX_MEAL_LIMIT:
+    if limit > MAX_PAGE_LIMIT:
         raise ToolError(
             code="INVALID_LIMIT",
-            message=f"limit cannot exceed {MAX_MEAL_LIMIT}",
-            max_limit=MAX_MEAL_LIMIT,
+            message=f"limit cannot exceed {MAX_PAGE_LIMIT}",
+            max_limit=MAX_PAGE_LIMIT,
         )
     return limit
 

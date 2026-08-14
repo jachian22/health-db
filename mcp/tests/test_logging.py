@@ -13,7 +13,12 @@ from tests.conftest import (
     TEST_READ_KEY,
     UNIQUE_FOOD,
     UNIQUE_GLUCOSE,
+    UNIQUE_KG,
+    UNIQUE_SLEEP_ID,
     UNIQUE_SOURCE_ID,
+    UNIQUE_STAGE,
+    UNIQUE_WEIGHT_ID,
+    UNIQUE_WORKOUT_ID,
     FakeQueryClient,
 )
 
@@ -36,9 +41,24 @@ async def test_logs_safe_metadata_not_health_values(
             "get_meals",
             {"start": "2026-08-01T00:00:00Z", "end": "2026-08-12T00:00:00Z"},
         )
+        await client.call_tool(
+            "get_workouts",
+            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-12T00:00:00Z"},
+        )
+        await client.call_tool(
+            "get_sleep_intervals",
+            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-12T00:00:00Z"},
+        )
+        await client.call_tool(
+            "get_weight_measurements",
+            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-12T00:00:00Z"},
+        )
     text = caplog.text
     assert "get_glucose_series" in text
     assert "get_meals" in text
+    assert "get_workouts" in text
+    assert "get_sleep_intervals" in text
+    assert "get_weight_measurements" in text
     assert "latency_ms=" in text
     assert "outcome=ok" in text
     assert "http_status=" not in text
@@ -50,4 +70,11 @@ async def test_logs_safe_metadata_not_health_values(
     assert str(UNIQUE_GLUCOSE) not in text
     assert UNIQUE_FOOD not in text
     assert UNIQUE_SOURCE_ID not in text
+    assert UNIQUE_WORKOUT_ID not in text
+    assert UNIQUE_SLEEP_ID not in text
+    assert UNIQUE_WEIGHT_ID not in text
+    assert UNIQUE_STAGE not in text
+    assert str(UNIQUE_KG) not in text
+    assert "310" not in text
+    assert "148" not in text
     assert "postgresql" not in text.lower()

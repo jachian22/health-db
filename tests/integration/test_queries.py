@@ -157,6 +157,155 @@ async def test_coverage_range_boundaries(
 
 
 @pytest.mark.asyncio
+async def test_coverage_workouts_and_sleep_use_overlap_not_start_in_window(
+    client: AsyncClient,
+    ingest_headers: dict,
+    read_headers: dict,
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            workouts=[
+                _workout(
+                    "cov-wo-touch-start",
+                    "2026-08-05T10:00:00.000Z",
+                    "2026-08-05T12:00:00.000Z",
+                ),
+                _workout(
+                    "cov-wo-overlap-start",
+                    "2026-08-05T11:00:00.000Z",
+                    "2026-08-05T13:00:00.000Z",
+                ),
+                _workout(
+                    "cov-wo-inside",
+                    "2026-08-05T13:00:00.000Z",
+                    "2026-08-05T14:00:00.000Z",
+                ),
+                _workout(
+                    "cov-wo-at-end",
+                    "2026-08-05T18:00:00.000Z",
+                    "2026-08-05T19:00:00.000Z",
+                ),
+            ],
+            sleep_sessions=[
+                _sleep(
+                    "cov-sl-touch-start",
+                    "2026-08-05T10:00:00.000Z",
+                    "2026-08-05T12:00:00.000Z",
+                    "awake",
+                ),
+                _sleep(
+                    "cov-sl-overlap-start",
+                    "2026-08-05T11:00:00.000Z",
+                    "2026-08-05T13:00:00.000Z",
+                    "core",
+                ),
+                _sleep(
+                    "cov-sl-inside",
+                    "2026-08-05T13:00:00.000Z",
+                    "2026-08-05T14:00:00.000Z",
+                    "deep",
+                ),
+                _sleep(
+                    "cov-sl-at-end",
+                    "2026-08-05T18:00:00.000Z",
+                    "2026-08-05T19:00:00.000Z",
+                    "rem",
+                ),
+            ],
+        ),
+    )
+    window = _q(start="2026-08-05T12:00:00Z", end="2026-08-05T18:00:00Z")
+    coverage = await client.get("/v1/query/coverage?" + window, headers=read_headers)
+    workouts = await client.get("/v1/query/workouts?" + window, headers=read_headers)
+    sleep = await client.get("/v1/query/sleep-intervals?" + window, headers=read_headers)
+    assert coverage.status_code == workouts.status_code == sleep.status_code == 200
+
+    cov = coverage.json()["coverage"]
+    assert cov["workouts"]["count"] == 2
+    assert cov["workouts"]["first_at"].startswith("2026-08-05T11:00:00")
+    assert cov["workouts"]["last_at"].startswith("2026-08-05T13:00:00")
+    assert cov["sleep_intervals"]["count"] == 2
+    assert cov["sleep_intervals"]["first_at"].startswith("2026-08-05T11:00:00")
+    assert cov["sleep_intervals"]["last_at"].startswith("2026-08-05T13:00:00")
+
+    assert workouts.json()["record_count"] == cov["workouts"]["count"]
+    assert [item["id"] for item in workouts.json()["items"]] == [
+        "cov-wo-overlap-start",
+        "cov-wo-inside",
+    ]
+    assert sleep.json()["record_count"] == cov["sleep_intervals"]["count"]
+    assert [item["id"] for item in sleep.json()["items"]] == [
+        "cov-sl-overlap-start",
+        "cov-sl-inside",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_coverage_interval_cross_window_span_matches_list(
+    client: AsyncClient,
+    ingest_headers: dict,
+    read_headers: dict,
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            workouts=[
+                _workout(
+                    "wo-left",
+                    "2026-08-05T12:00:00.000Z",
+                    "2026-08-05T13:00:00.000Z",
+                ),
+                _workout(
+                    "wo-span",
+                    "2026-08-05T14:00:00.000Z",
+                    "2026-08-05T16:00:00.000Z",
+                ),
+                _workout(
+                    "wo-right",
+                    "2026-08-05T17:00:00.000Z",
+                    "2026-08-05T18:00:00.000Z",
+                ),
+            ],
+            sleep_sessions=[
+                _sleep(
+                    "sl-span",
+                    "2026-08-05T14:00:00.000Z",
+                    "2026-08-05T16:00:00.000Z",
+                    "core",
+                ),
+            ],
+        ),
+    )
+    left = _q(start="2026-08-05T12:00:00Z", end="2026-08-05T15:00:00Z")
+    right = _q(start="2026-08-05T15:00:00Z", end="2026-08-05T18:00:00Z")
+
+    left_cov = (await client.get("/v1/query/coverage?" + left, headers=read_headers)).json()
+    right_cov = (await client.get("/v1/query/coverage?" + right, headers=read_headers)).json()
+    left_wo = (await client.get("/v1/query/workouts?" + left, headers=read_headers)).json()
+    right_wo = (await client.get("/v1/query/workouts?" + right, headers=read_headers)).json()
+    left_sl = (await client.get("/v1/query/sleep-intervals?" + left, headers=read_headers)).json()
+    right_sl = (await client.get("/v1/query/sleep-intervals?" + right, headers=read_headers)).json()
+
+    assert left_cov["coverage"]["workouts"]["count"] == left_wo["record_count"] == 2
+    assert right_cov["coverage"]["workouts"]["count"] == right_wo["record_count"] == 2
+    assert {item["id"] for item in left_wo["items"]} == {"wo-left", "wo-span"}
+    assert {item["id"] for item in right_wo["items"]} == {"wo-span", "wo-right"}
+    assert left_cov["coverage"]["workouts"]["first_at"].startswith("2026-08-05T12:00:00")
+    assert left_cov["coverage"]["workouts"]["last_at"].startswith("2026-08-05T14:00:00")
+    assert right_cov["coverage"]["workouts"]["first_at"].startswith("2026-08-05T14:00:00")
+    assert right_cov["coverage"]["workouts"]["last_at"].startswith("2026-08-05T17:00:00")
+
+    assert left_cov["coverage"]["sleep_intervals"]["count"] == left_sl["record_count"] == 1
+    assert right_cov["coverage"]["sleep_intervals"]["count"] == right_sl["record_count"] == 1
+    assert left_sl["items"][0]["id"] == right_sl["items"][0]["id"] == "sl-span"
+    assert left_cov["coverage"]["sleep_intervals"]["first_at"].startswith("2026-08-05T14:00:00")
+    assert left_cov["coverage"]["sleep_intervals"]["last_at"].startswith("2026-08-05T14:00:00")
+
+
+@pytest.mark.asyncio
 async def test_invalid_time_range_rejected(client: AsyncClient, read_headers: dict):
     bad = await client.get(
         "/v1/query/coverage?"
@@ -806,6 +955,9 @@ async def test_query_endpoints_get_only(client: AsyncClient, read_headers: dict)
         "/v1/query/glucose/series",
         "/v1/query/glucose/summary",
         "/v1/query/meals",
+        "/v1/query/workouts",
+        "/v1/query/sleep-intervals",
+        "/v1/query/weight-measurements",
     ):
         resp = await client.post(
             path + "?" + _q(start="2026-08-01T00:00:00Z", end="2026-08-02T00:00:00Z"),
@@ -864,3 +1016,528 @@ async def test_fixture_meals_notes_absent_from_query(
     item = resp.json()["items"][0]
     assert "notes" not in item
     assert item["foods"] == ["rice", "chicken"]
+
+
+# --- Workouts / sleep / weight list endpoints ---
+
+
+NEW_LIST_PATHS = (
+    "/v1/query/workouts",
+    "/v1/query/sleep-intervals",
+    "/v1/query/weight-measurements",
+)
+
+
+def _export_body(**overrides: object) -> dict:
+    body: dict = {
+        "schema_version": 1,
+        "exported_at": "2026-08-10T12:00:00Z",
+        "data_start": "2026-07-01T00:00:00Z",
+        "data_end": "2026-08-10T12:00:00Z",
+        "glucose_samples": [],
+        "workouts": [],
+        "sleep_sessions": [],
+        "weight_measurements": [],
+        "meal_events": [],
+    }
+    body.update(overrides)
+    return body
+
+
+def _workout(
+    sample_id: str,
+    start: str,
+    end: str,
+    *,
+    distance: float | None = 5000,
+    kcal: float | None = 310,
+    avg_hr: float | None = 148,
+    max_hr: float | None = 172,
+) -> dict:
+    return {
+        "source": "apple_health",
+        "source_sample_id": sample_id,
+        "source_name": "Strava",
+        "start_time": start,
+        "end_time": end,
+        "sport": "running",
+        "distance_meters": distance,
+        "active_energy_kcal": kcal,
+        "average_heart_rate": avg_hr,
+        "maximum_heart_rate": max_hr,
+        "metadata": {"source_app": "Strava", "secret": "do-not-leak"},
+    }
+
+
+def _sleep(sample_id: str, start: str, end: str, stage: str) -> dict:
+    return {
+        "source": "apple_health",
+        "source_sample_id": sample_id,
+        "source_name": "Apple Watch",
+        "start_time": start,
+        "end_time": end,
+        "stage": stage,
+        "metadata": {"source_app": "Apple Watch"},
+    }
+
+
+def _weight(sample_id: str, measured_at: str, value: float) -> dict:
+    return {
+        "source": "apple_health",
+        "source_sample_id": sample_id,
+        "source_name": "Health",
+        "measured_at": measured_at,
+        "value": value,
+        "unit": "kg",
+        "metadata": {"source_app": "Health"},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", NEW_LIST_PATHS)
+async def test_list_missing_auth_returns_401(client: AsyncClient, path: str):
+    resp = await client.get(
+        path + "?" + _q(start="2026-08-01T00:00:00Z", end="2026-08-02T00:00:00Z")
+    )
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "UNAUTHORIZED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", NEW_LIST_PATHS)
+async def test_list_wrong_key_returns_401(client: AsyncClient, path: str):
+    resp = await client.get(
+        path + "?" + _q(start="2026-08-01T00:00:00Z", end="2026-08-02T00:00:00Z"),
+        headers={"Authorization": "Bearer wrong-key"},
+    )
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "UNAUTHORIZED"
+    assert "wrong-key" not in resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", NEW_LIST_PATHS)
+async def test_list_ingest_key_returns_401(
+    client: AsyncClient, ingest_headers: dict, path: str
+):
+    resp = await client.get(
+        path + "?" + _q(start="2026-08-01T00:00:00Z", end="2026-08-02T00:00:00Z"),
+        headers=ingest_headers,
+    )
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "UNAUTHORIZED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", NEW_LIST_PATHS)
+async def test_list_empty_window_succeeds(client: AsyncClient, read_headers: dict, path: str):
+    resp = await client.get(
+        path + "?" + _q(start="2025-01-01T00:00:00Z", end="2025-01-02T00:00:00Z"),
+        headers=read_headers,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["items"] == []
+    assert body["record_count"] == 0
+    assert body["truncated"] is False
+    assert body["next_cursor"] is None
+    assert body["data_fresh_through"] is None
+    assert body["timezone"] == "America/New_York"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", NEW_LIST_PATHS)
+async def test_list_naive_timestamp_rejected(
+    client: AsyncClient, read_headers: dict, path: str
+):
+    resp = await client.get(
+        path + "?" + _q(start="2026-08-01T00:00:00", end="2026-08-02T00:00:00Z"),
+        headers=read_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "INVALID_TIME_RANGE"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", NEW_LIST_PATHS)
+async def test_list_end_not_after_start_rejected(
+    client: AsyncClient, read_headers: dict, path: str
+):
+    resp = await client.get(
+        path + "?" + _q(start="2026-08-02T00:00:00Z", end="2026-08-01T00:00:00Z"),
+        headers=read_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "INVALID_TIME_RANGE"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "over_end", "ok_end", "max_days"),
+    [
+        (
+            "/v1/query/workouts",
+            "2027-08-02T00:00:00Z",
+            "2027-08-01T00:00:00Z",
+            365,
+        ),
+        (
+            "/v1/query/weight-measurements",
+            "2027-08-02T00:00:00Z",
+            "2027-08-01T00:00:00Z",
+            365,
+        ),
+        (
+            "/v1/query/sleep-intervals",
+            "2026-10-31T00:00:00Z",
+            "2026-10-30T00:00:00Z",
+            90,
+        ),
+    ],
+)
+async def test_list_window_limits(
+    client: AsyncClient,
+    read_headers: dict,
+    path: str,
+    over_end: str,
+    ok_end: str,
+    max_days: int,
+):
+    start = "2026-08-01T00:00:00Z"
+    too_big = await client.get(
+        path + "?" + _q(start=start, end=over_end),
+        headers=read_headers,
+    )
+    assert too_big.status_code == 422
+    assert too_big.json()["error"]["code"] == "RANGE_TOO_LARGE"
+    assert too_big.json()["error"]["details"]["max_days"] == max_days
+
+    ok = await client.get(
+        path + "?" + _q(start=start, end=ok_end),
+        headers=read_headers,
+    )
+    assert ok.status_code == 200
+    assert ok.json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_workout_overlap_boundaries_and_unclipped_timestamps(
+    client: AsyncClient,
+    ingest_headers: dict,
+    read_headers: dict,
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            workouts=[
+                _workout(
+                    "wo-before-touch",
+                    "2026-08-05T10:00:00.000Z",
+                    "2026-08-05T12:00:00.000Z",
+                ),
+                _workout(
+                    "wo-overlap-start",
+                    "2026-08-05T11:00:00.000Z",
+                    "2026-08-05T13:00:00.000Z",
+                ),
+                _workout(
+                    "wo-inside",
+                    "2026-08-05T13:00:00.000Z",
+                    "2026-08-05T14:00:00.000Z",
+                ),
+                _workout(
+                    "wo-at-end",
+                    "2026-08-05T18:00:00.000Z",
+                    "2026-08-05T19:00:00.000Z",
+                ),
+            ]
+        ),
+    )
+    resp = await client.get(
+        "/v1/query/workouts?"
+        + _q(start="2026-08-05T12:00:00Z", end="2026-08-05T18:00:00Z"),
+        headers=read_headers,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    ids = [item["id"] for item in body["items"]]
+    assert ids == ["wo-overlap-start", "wo-inside"]
+    overlap = body["items"][0]
+    assert overlap["start_time"].startswith("2026-08-05T11:00:00")
+    assert overlap["end_time"].startswith("2026-08-05T13:00:00")
+    assert overlap["sport"] == "running"
+    assert overlap["distance_meters"] == 5000
+    assert overlap["duration_minutes"] == 120.0
+    assert overlap["source"] == "apple_health"
+    assert overlap["id"] == "wo-overlap-start"
+    for forbidden in (
+        "average_heart_rate",
+        "maximum_heart_rate",
+        "active_energy_kcal",
+        "metadata",
+        "source_name",
+        "user_id",
+        "health_source_id",
+        "notes",
+    ):
+        assert forbidden not in overlap
+    assert "148" not in resp.text
+    assert "172" not in resp.text
+    assert "do-not-leak" not in resp.text
+    assert body["data_fresh_through"].startswith("2026-08-05T14:00:00")
+
+    first_page = await client.get(
+        "/v1/query/workouts?"
+        + _q(start="2026-08-05T12:00:00Z", end="2026-08-05T18:00:00Z", limit="1"),
+        headers=read_headers,
+    )
+    assert first_page.status_code == 200
+    page = first_page.json()
+    assert page["truncated"] is True
+    assert [item["id"] for item in page["items"]] == ["wo-overlap-start"]
+    assert page["data_fresh_through"].startswith("2026-08-05T13:00:00")
+
+
+@pytest.mark.asyncio
+async def test_workout_sensitive_fields_absent_from_seed(
+    client: AsyncClient,
+    ingest_headers: dict,
+    read_headers: dict,
+    query_seed_body: dict,
+):
+    await _seed(client, ingest_headers, query_seed_body)
+    resp = await client.get(
+        "/v1/query/workouts?"
+        + _q(start="2026-08-01T00:00:00Z", end="2026-08-08T00:00:00Z"),
+        headers=read_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["record_count"] == 1
+    item = resp.json()["items"][0]
+    assert "average_heart_rate" not in item
+    assert "maximum_heart_rate" not in item
+    assert "active_energy_kcal" not in item
+    assert "310" not in resp.text
+    assert "148" not in resp.text
+    assert "172" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_sleep_overlap_preserves_adjacent_raw_intervals(
+    client: AsyncClient,
+    ingest_headers: dict,
+    read_headers: dict,
+    query_seed_body: dict,
+):
+    await _seed(client, ingest_headers, query_seed_body)
+    resp = await client.get(
+        "/v1/query/sleep-intervals?"
+        + _q(start="2026-08-06T00:00:00Z", end="2026-08-06T02:00:00Z"),
+        headers=read_headers,
+    )
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert [item["id"] for item in items] == [
+        "cccccccc-1111-2222-3333-444444444401",
+        "cccccccc-1111-2222-3333-444444444402",
+    ]
+    assert items[0]["stage"] == "core"
+    assert items[1]["stage"] == "deep"
+    assert items[0]["start_time"].startswith("2026-08-05T23:10:00")
+    assert items[0]["end_time"].startswith("2026-08-06T00:30:00")
+    assert items[1]["start_time"].startswith("2026-08-06T00:30:00")
+    assert items[0]["duration_minutes"] == 80.0
+    assert items[1]["duration_minutes"] == 40.0
+
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            sleep_sessions=[
+                _sleep(
+                    "sl-touch-start",
+                    "2026-08-05T10:00:00.000Z",
+                    "2026-08-05T12:00:00.000Z",
+                    "awake",
+                ),
+                _sleep(
+                    "sl-at-end",
+                    "2026-08-05T18:00:00.000Z",
+                    "2026-08-05T19:00:00.000Z",
+                    "rem",
+                ),
+            ]
+        ),
+    )
+    bounded = await client.get(
+        "/v1/query/sleep-intervals?"
+        + _q(start="2026-08-05T12:00:00Z", end="2026-08-05T18:00:00Z"),
+        headers=read_headers,
+    )
+    assert bounded.status_code == 200
+    assert bounded.json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_weight_point_window_boundaries(
+    client: AsyncClient,
+    ingest_headers: dict,
+    read_headers: dict,
+):
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(
+            weight_measurements=[
+                _weight("wt-before", "2026-08-04T07:59:59.000Z", 70.0),
+                _weight("wt-start", "2026-08-04T08:00:00.000Z", 71.25),
+                _weight("wt-end", "2026-08-04T09:00:00.000Z", 72.0),
+            ]
+        ),
+    )
+    resp = await client.get(
+        "/v1/query/weight-measurements?"
+        + _q(start="2026-08-04T08:00:00Z", end="2026-08-04T09:00:00Z"),
+        headers=read_headers,
+    )
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert [item["id"] for item in items] == ["wt-start"]
+    assert items[0]["value_kg"] == 71.25
+    assert items[0]["measured_at"].startswith("2026-08-04T08:00:00")
+    assert items[0]["source"] == "apple_health"
+    assert "unit" not in items[0]
+
+
+@pytest.mark.asyncio
+async def test_list_pagination_stable_order_and_cursor_isolation(
+    client: AsyncClient,
+    ingest_headers: dict,
+    read_headers: dict,
+):
+    workouts = [
+        _workout(
+            f"wo-page-{i}",
+            f"2026-08-05T0{6 + i}:00:00.000Z",
+            f"2026-08-05T0{6 + i}:30:00.000Z",
+            kcal=None,
+            avg_hr=None,
+            max_hr=None,
+        )
+        for i in range(3)
+    ]
+    sleeps = [
+        _sleep(
+            f"sl-page-{i}",
+            f"2026-08-05T0{6 + i}:00:00.000Z",
+            f"2026-08-05T0{6 + i}:20:00.000Z",
+            "core",
+        )
+        for i in range(3)
+    ]
+    weights = [
+        _weight(f"wt-page-{i}", f"2026-08-05T0{6 + i}:00:00.000Z", 70.0 + i)
+        for i in range(3)
+    ]
+    await _seed(
+        client,
+        ingest_headers,
+        _export_body(workouts=workouts, sleep_sessions=sleeps, weight_measurements=weights),
+    )
+
+    page_params = {
+        "start": "2026-08-05T00:00:00Z",
+        "end": "2026-08-06T00:00:00Z",
+        "limit": "1",
+    }
+
+    wo1 = await client.get("/v1/query/workouts", params=page_params, headers=read_headers)
+    sl1 = await client.get(
+        "/v1/query/sleep-intervals", params=page_params, headers=read_headers
+    )
+    wt1 = await client.get(
+        "/v1/query/weight-measurements", params=page_params, headers=read_headers
+    )
+    assert wo1.status_code == sl1.status_code == wt1.status_code == 200
+    assert wo1.json()["truncated"] is True
+    assert sl1.json()["truncated"] is True
+    assert wt1.json()["truncated"] is True
+    assert wo1.json()["items"][0]["id"] == "wo-page-0"
+    assert sl1.json()["items"][0]["id"] == "sl-page-0"
+    assert wt1.json()["items"][0]["id"] == "wt-page-0"
+
+    wo_cursor = wo1.json()["next_cursor"]
+    sl_cursor = sl1.json()["next_cursor"]
+    wt_cursor = wt1.json()["next_cursor"]
+
+    wo2 = await client.get(
+        "/v1/query/workouts",
+        params={**page_params, "cursor": wo_cursor},
+        headers=read_headers,
+    )
+    assert wo2.status_code == 200
+    assert wo2.json()["items"][0]["id"] == "wo-page-1"
+
+    crossed = await client.get(
+        "/v1/query/sleep-intervals",
+        params={**page_params, "cursor": wo_cursor},
+        headers=read_headers,
+    )
+    assert crossed.status_code == 422
+    assert crossed.json()["error"]["code"] == "INVALID_CURSOR"
+
+    mismatched = await client.get(
+        "/v1/query/workouts",
+        params={
+            "start": "2026-08-05T00:00:00Z",
+            "end": "2026-08-05T12:00:00Z",
+            "limit": "1",
+            "cursor": wo_cursor,
+        },
+        headers=read_headers,
+    )
+    assert mismatched.status_code == 422
+    assert mismatched.json()["error"]["code"] == "INVALID_CURSOR"
+
+    bad = await client.get(
+        "/v1/query/weight-measurements",
+        params={**page_params, "cursor": "not-a-valid-cursor"},
+        headers=read_headers,
+    )
+    assert bad.status_code == 422
+    assert bad.json()["error"]["code"] == "INVALID_CURSOR"
+
+    meal_with_wo = await client.get(
+        "/v1/query/meals",
+        params={**page_params, "cursor": wo_cursor},
+        headers=read_headers,
+    )
+    assert meal_with_wo.status_code == 422
+    assert meal_with_wo.json()["error"]["code"] == "INVALID_CURSOR"
+
+    wo3 = await client.get(
+        "/v1/query/workouts",
+        params={**page_params, "cursor": wo2.json()["next_cursor"]},
+        headers=read_headers,
+    )
+    assert [
+        wo1.json()["items"][0]["id"],
+        wo2.json()["items"][0]["id"],
+        wo3.json()["items"][0]["id"],
+    ] == ["wo-page-0", "wo-page-1", "wo-page-2"]
+    assert wo3.json()["truncated"] is False
+    assert wo3.json()["next_cursor"] is None
+
+    sl2 = await client.get(
+        "/v1/query/sleep-intervals",
+        params={**page_params, "cursor": sl_cursor},
+        headers=read_headers,
+    )
+    wt2 = await client.get(
+        "/v1/query/weight-measurements",
+        params={**page_params, "cursor": wt_cursor},
+        headers=read_headers,
+    )
+    assert sl2.json()["items"][0]["id"] == "sl-page-1"
+    assert wt2.json()["items"][0]["id"] == "wt-page-1"

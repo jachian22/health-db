@@ -31,6 +31,12 @@ from mcp_service.models import (  # noqa: E402
     GlucoseSummaryStats,
     MealItem,
     MealsResponse,
+    SleepIntervalItem,
+    SleepIntervalsResponse,
+    WeightMeasurementItem,
+    WeightMeasurementsResponse,
+    WorkoutItem,
+    WorkoutsResponse,
 )
 from mcp_service.tools import build_mcp_server  # noqa: E402
 
@@ -40,6 +46,11 @@ TEST_INGEST_KEY = "test-ingest-key"
 UNIQUE_FOOD = "UNIQUE_FOOD_STRING_xyz"
 UNIQUE_GLUCOSE = 123.456
 UNIQUE_SOURCE_ID = "source-sample-UNIQUE-id"
+UNIQUE_KG = 88.125
+UNIQUE_STAGE = "UNIQUE_SLEEP_STAGE_xyz"
+UNIQUE_WORKOUT_ID = "workout-sample-UNIQUE-id"
+UNIQUE_SLEEP_ID = "sleep-sample-UNIQUE-id"
+UNIQUE_WEIGHT_ID = "weight-sample-UNIQUE-id"
 
 START = datetime(2026, 8, 1, tzinfo=UTC)
 END = datetime(2026, 8, 12, tzinfo=UTC)
@@ -148,6 +159,88 @@ def default_meals() -> MealsResponse:
     )
 
 
+def default_workouts() -> WorkoutsResponse:
+    return WorkoutsResponse(
+        request_id="query-req-5",
+        start=START,
+        end=END,
+        timezone="America/New_York",
+        record_count=1,
+        truncated=False,
+        next_cursor=None,
+        data_fresh_through=datetime(2026, 8, 5, 6, 0, tzinfo=UTC),
+        items=[
+            WorkoutItem(
+                id=UNIQUE_WORKOUT_ID,
+                start_time=datetime(2026, 8, 5, 6, 0, tzinfo=UTC),
+                end_time=datetime(2026, 8, 5, 6, 32, tzinfo=UTC),
+                sport="running",
+                distance_meters=5200.0,
+                duration_minutes=32.0,
+                source="apple_health",
+            )
+        ],
+    )
+
+
+def default_sleep_intervals() -> SleepIntervalsResponse:
+    return SleepIntervalsResponse(
+        request_id="query-req-6",
+        start=START,
+        end=END,
+        timezone="America/New_York",
+        record_count=1,
+        truncated=False,
+        next_cursor=None,
+        data_fresh_through=datetime(2026, 8, 5, 23, 10, tzinfo=UTC),
+        items=[
+            SleepIntervalItem(
+                id=UNIQUE_SLEEP_ID,
+                start_time=datetime(2026, 8, 5, 23, 10, tzinfo=UTC),
+                end_time=datetime(2026, 8, 6, 0, 30, tzinfo=UTC),
+                duration_minutes=80.0,
+                stage=UNIQUE_STAGE,
+                source="apple_health",
+            )
+        ],
+    )
+
+
+def empty_sleep_intervals() -> SleepIntervalsResponse:
+    return SleepIntervalsResponse(
+        request_id="query-req-6-empty",
+        start=START,
+        end=END,
+        timezone="America/New_York",
+        record_count=0,
+        truncated=False,
+        next_cursor=None,
+        data_fresh_through=None,
+        items=[],
+    )
+
+
+def default_weight_measurements() -> WeightMeasurementsResponse:
+    return WeightMeasurementsResponse(
+        request_id="query-req-7",
+        start=START,
+        end=END,
+        timezone="America/New_York",
+        record_count=1,
+        truncated=False,
+        next_cursor=None,
+        data_fresh_through=datetime(2026, 8, 4, 8, 0, tzinfo=UTC),
+        items=[
+            WeightMeasurementItem(
+                id=UNIQUE_WEIGHT_ID,
+                measured_at=datetime(2026, 8, 4, 8, 0, tzinfo=UTC),
+                value_kg=UNIQUE_KG,
+                source="apple_health",
+            )
+        ],
+    )
+
+
 @dataclass
 class FakeQueryClient:
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
@@ -155,6 +248,11 @@ class FakeQueryClient:
     series: GlucoseSeriesResponse = field(default_factory=default_series)
     summary: GlucoseSummaryResponse = field(default_factory=default_summary)
     meals: MealsResponse = field(default_factory=default_meals)
+    workouts: WorkoutsResponse = field(default_factory=default_workouts)
+    sleep_intervals: SleepIntervalsResponse = field(default_factory=default_sleep_intervals)
+    weight_measurements: WeightMeasurementsResponse = field(
+        default_factory=default_weight_measurements
+    )
     ready_ok: bool = True
     error: Exception | None = None
     closed: bool = False
@@ -189,6 +287,24 @@ class FakeQueryClient:
         if self.error:
             raise self.error
         return self.meals
+
+    async def get_workouts(self, **kwargs: Any) -> WorkoutsResponse:
+        self.calls.append(("workouts", kwargs))
+        if self.error:
+            raise self.error
+        return self.workouts
+
+    async def get_sleep_intervals(self, **kwargs: Any) -> SleepIntervalsResponse:
+        self.calls.append(("sleep_intervals", kwargs))
+        if self.error:
+            raise self.error
+        return self.sleep_intervals
+
+    async def get_weight_measurements(self, **kwargs: Any) -> WeightMeasurementsResponse:
+        self.calls.append(("weight_measurements", kwargs))
+        if self.error:
+            raise self.error
+        return self.weight_measurements
 
 
 @pytest.fixture

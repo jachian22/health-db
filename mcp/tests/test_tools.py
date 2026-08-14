@@ -13,13 +13,22 @@ from mcp_service.tools import (
     GLUCOSE_SERIES_DESCRIPTION,
     GLUCOSE_SUMMARY_DESCRIPTION,
     MEALS_DESCRIPTION,
+    SLEEP_INTERVALS_DESCRIPTION,
+    WEIGHT_MEASUREMENTS_DESCRIPTION,
+    WORKOUTS_DESCRIPTION,
 )
 from tests.conftest import (
     TEST_READ_KEY,
     UNIQUE_FOOD,
     UNIQUE_GLUCOSE,
+    UNIQUE_KG,
+    UNIQUE_SLEEP_ID,
+    UNIQUE_STAGE,
+    UNIQUE_WEIGHT_ID,
+    UNIQUE_WORKOUT_ID,
     FakeQueryClient,
     assert_no_secrets,
+    empty_sleep_intervals,
 )
 
 
@@ -31,7 +40,7 @@ def _error_payload(result) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_lists_exactly_four_tools(mcp_server):
+async def test_lists_exactly_seven_tools(mcp_server):
     async with Client(mcp_server) as client:
         listed = await client.list_tools()
     names = [tool.name for tool in listed.tools]
@@ -40,6 +49,9 @@ async def test_lists_exactly_four_tools(mcp_server):
         "get_glucose_series",
         "get_glucose_summary",
         "get_meals",
+        "get_workouts",
+        "get_sleep_intervals",
+        "get_weight_measurements",
     ]
     by_name = {tool.name: tool for tool in listed.tools}
     assert "Call this first when exploring an unfamiliar date range" in by_name[
@@ -49,9 +61,19 @@ async def test_lists_exactly_four_tools(mcp_server):
     assert "does not provide medical advice" in by_name["get_glucose_summary"].description
     assert "Meal notes are intentionally excluded" in by_name["get_meals"].description
     assert by_name["get_data_coverage"].description == COVERAGE_DESCRIPTION
+    assert by_name["get_workouts"].description == WORKOUTS_DESCRIPTION
+    assert by_name["get_sleep_intervals"].description == SLEEP_INTERVALS_DESCRIPTION
+    assert by_name["get_weight_measurements"].description == WEIGHT_MEASUREMENTS_DESCRIPTION
     assert "15m: maximum 90 days" in GLUCOSE_SERIES_DESCRIPTION
     assert "Daily grouping" in GLUCOSE_SUMMARY_DESCRIPTION
     assert "next_cursor" in MEALS_DESCRIPTION
+    assert "overlap" in WORKOUTS_DESCRIPTION
+    assert "interval overlap" in COVERAGE_DESCRIPTION
+    assert "may differ" not in COVERAGE_DESCRIPTION
+    assert "may differ" not in WORKOUTS_DESCRIPTION
+    assert "may differ" not in SLEEP_INTERVALS_DESCRIPTION
+    assert "not sessionized" in SLEEP_INTERVALS_DESCRIPTION
+    assert "value_kg" in WEIGHT_MEASUREMENTS_DESCRIPTION
 
 
 @pytest.mark.asyncio
@@ -193,3 +215,104 @@ async def test_tool_response_preserves_query_api_fields(
     ):
         assert key in meals_data
     assert series_data["points"][0]["value_mg_dl"] == UNIQUE_GLUCOSE
+
+
+_LIST_ENVELOPE = (
+    "start",
+    "end",
+    "timezone",
+    "record_count",
+    "truncated",
+    "next_cursor",
+    "data_fresh_through",
+    "items",
+)
+
+
+@pytest.mark.asyncio
+async def test_get_workouts_maps_to_query_client(
+    mcp_server, fake_query_client: FakeQueryClient
+):
+    cursor = "opaque-workout-cursor"
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "get_workouts",
+            {
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-12T00:00:00Z",
+                "limit": 25,
+                "cursor": cursor,
+            },
+        )
+    assert result.is_error is False
+    assert fake_query_client.calls[0][0] == "workouts"
+    kwargs = fake_query_client.calls[0][1]
+    assert kwargs["limit"] == 25
+    assert kwargs["cursor"] == cursor
+    data = result.structured_content
+    for key in _LIST_ENVELOPE:
+        assert key in data
+    item = data["items"][0]
+    assert item["id"] == UNIQUE_WORKOUT_ID
+    assert item["sport"] == "running"
+    assert "average_heart_rate" not in item
+    assert "active_energy_kcal" not in item
+    assert "source_name" not in item
+    assert_no_secrets(json.dumps(data))
+
+
+@pytest.mark.asyncio
+async def test_get_sleep_intervals_empty_envelope(
+    mcp_server, fake_query_client: FakeQueryClient
+):
+    fake_query_client.sleep_intervals = empty_sleep_intervals()
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "get_sleep_intervals",
+            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-12T00:00:00Z"},
+        )
+    assert result.is_error is False
+    data = result.structured_content
+    assert data["items"] == []
+    assert data["record_count"] == 0
+    assert data["truncated"] is False
+    assert data["next_cursor"] is None
+    assert data["data_fresh_through"] is None
+    for key in _LIST_ENVELOPE:
+        assert key in data
+
+
+@pytest.mark.asyncio
+async def test_get_sleep_intervals_preserves_raw_stage(
+    mcp_server, fake_query_client: FakeQueryClient
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "get_sleep_intervals",
+            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-12T00:00:00Z"},
+        )
+    data = result.structured_content
+    assert data["items"][0]["id"] == UNIQUE_SLEEP_ID
+    assert data["items"][0]["stage"] == UNIQUE_STAGE
+    assert "quality" not in data["items"][0]
+
+
+@pytest.mark.asyncio
+async def test_get_weight_measurements_maps_to_query_client(
+    mcp_server, fake_query_client: FakeQueryClient
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "get_weight_measurements",
+            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-12T00:00:00Z"},
+        )
+    assert result.is_error is False
+    assert fake_query_client.calls[0][0] == "weight_measurements"
+    data = result.structured_content
+    for key in _LIST_ENVELOPE:
+        assert key in data
+    item = data["items"][0]
+    assert item["id"] == UNIQUE_WEIGHT_ID
+    assert item["value_kg"] == UNIQUE_KG
+    assert "unit" not in item
+    assert "lb" not in json.dumps(data)

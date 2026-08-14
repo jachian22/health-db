@@ -7,10 +7,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.core import (
     ALLOWED_GLUCOSE_RESOLUTIONS,
-    DEFAULT_MEAL_LIMIT,
+    DEFAULT_PAGE_LIMIT,
     DEFAULT_QUERY_TIMEZONE,
     MAX_GLUCOSE_POINTS,
-    MAX_MEAL_LIMIT,
+    MAX_PAGE_LIMIT,
     RESOLUTION_MAX_DAYS,
 )
 from app.core.errors import AppError
@@ -106,20 +106,36 @@ def validate_summary_bucket(bucket: str) -> str:
     return bucket
 
 
-def validate_meal_limit(limit: int | None) -> int:
+def enforce_max_range_days(
+    start: datetime,
+    end: datetime,
+    *,
+    max_days: int,
+    label: str,
+) -> None:
+    if end - start > timedelta(days=max_days):
+        raise AppError(
+            code="RANGE_TOO_LARGE",
+            message=f"{label} queries are limited to {max_days} days",
+            status_code=422,
+            details={"max_days": max_days},
+        )
+
+
+def validate_page_limit(limit: int | None) -> int:
     if limit is None:
-        return DEFAULT_MEAL_LIMIT
+        return DEFAULT_PAGE_LIMIT
     if limit < 1:
         raise AppError(
             code="INVALID_LIMIT",
             message="limit must be a positive integer",
             status_code=422,
         )
-    if limit > MAX_MEAL_LIMIT:
+    if limit > MAX_PAGE_LIMIT:
         raise AppError(
             code="INVALID_LIMIT",
-            message=f"limit cannot exceed {MAX_MEAL_LIMIT}",
+            message=f"limit cannot exceed {MAX_PAGE_LIMIT}",
             status_code=422,
-            details={"max_limit": MAX_MEAL_LIMIT},
+            details={"max_limit": MAX_PAGE_LIMIT},
         )
     return limit

@@ -12,6 +12,8 @@ import hashlib
 import hmac
 import logging
 import uuid
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -19,16 +21,23 @@ from typing import Any
 from sqlalchemy import func, literal, select, text, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import MAX_GLUCOSE_POINTS, RESOLUTION_SECONDS
+from app.core import (
+    MAX_GLUCOSE_POINTS,
+    MAX_SLEEP_RANGE_DAYS,
+    MAX_WEIGHT_RANGE_DAYS,
+    MAX_WORKOUT_RANGE_DAYS,
+    RESOLUTION_SECONDS,
+)
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.db.models import GlucoseSample, MealEvent, SleepInterval, User, WeightMeasurement, Workout
 from app.schemas.queries import (
     enforce_glucose_point_limit,
     enforce_glucose_range_limit,
+    enforce_max_range_days,
     parse_timezone,
     validate_glucose_resolution,
-    validate_meal_limit,
+    validate_page_limit,
     validate_summary_bucket,
     validate_time_range,
 )
@@ -44,7 +53,15 @@ from app.schemas.responses import (
     GlucoseSummaryStats,
     MealItem,
     MealsResponse,
+    SleepIntervalItem,
+    SleepIntervalsResponse,
+    WeightMeasurementItem,
+    WeightMeasurementsResponse,
+    WorkoutItem,
+    WorkoutsResponse,
 )
+
+PAGE_CURSOR_KINDS = frozenset({"workouts", "sleep_intervals", "weight_measurements"})
 
 logger = logging.getLogger("app.query")
 
@@ -81,6 +98,44 @@ def _sign_payload(secret: str, payload: str) -> str:
     ).hexdigest()[:32]
 
 
+def _encode_signed_cursor(secret: str, *parts: str) -> str:
+    payload = "|".join(parts)
+    signed = f"{payload}|{_sign_payload(secret, payload)}"
+    return base64.urlsafe_b64encode(signed.encode("utf-8")).decode("ascii")
+
+
+def _decode_signed_cursor(secret: str, cursor: str, payload_fields: int) -> list[str]:
+    raw = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+    pieces = raw.split("|", payload_fields)
+    if len(pieces) != payload_fields + 1:
+        raise ValueError("bad cursor fields")
+    *fields, sig = pieces
+    if not sig or any(not field for field in fields):
+        raise ValueError("bad cursor fields")
+    payload = "|".join(fields)
+    expected = _sign_payload(secret, payload)
+    if not hmac.compare_digest(sig, expected):
+        raise ValueError("bad signature")
+    return fields
+
+
+def _parse_cursor_range(
+    start_s: str,
+    end_s: str,
+    stamp_s: str,
+    range_start: datetime,
+    range_end: datetime,
+) -> datetime:
+    cursor_start = datetime.fromisoformat(start_s.replace("Z", "+00:00")).astimezone(UTC)
+    cursor_end = datetime.fromisoformat(end_s.replace("Z", "+00:00")).astimezone(UTC)
+    if cursor_start != _ensure_aware(range_start) or cursor_end != _ensure_aware(range_end):
+        raise ValueError("range mismatch")
+    stamp_at = datetime.fromisoformat(stamp_s.replace("Z", "+00:00"))
+    if stamp_at.tzinfo is None:
+        raise ValueError("naive cursor timestamp")
+    return stamp_at.astimezone(UTC)
+
+
 def encode_meal_cursor(
     *,
     secret: str,
@@ -89,17 +144,14 @@ def encode_meal_cursor(
     completed_at: datetime,
     source_sample_id: str,
 ) -> str:
-    payload = "|".join(
-        [
-            "v1",
-            _iso_z(range_start),
-            _iso_z(range_end),
-            _iso_z(completed_at),
-            source_sample_id,
-        ]
+    return _encode_signed_cursor(
+        secret,
+        "v1",
+        _iso_z(range_start),
+        _iso_z(range_end),
+        _iso_z(completed_at),
+        source_sample_id,
     )
-    signed = f"{payload}|{_sign_payload(secret, payload)}"
-    return base64.urlsafe_b64encode(signed.encode("utf-8")).decode("ascii")
 
 
 def decode_meal_cursor(
@@ -110,28 +162,91 @@ def decode_meal_cursor(
     range_end: datetime,
 ) -> tuple[datetime, str]:
     try:
-        raw = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
-        version, start_s, end_s, stamp, source_sample_id, sig = raw.split("|", 5)
-        if version != "v1" or not source_sample_id or not sig:
+        version, start_s, end_s, stamp, source_sample_id = _decode_signed_cursor(
+            secret, cursor, 5
+        )
+        if version != "v1":
             raise ValueError("bad cursor fields")
-        payload = "|".join([version, start_s, end_s, stamp, source_sample_id])
-        expected = _sign_payload(secret, payload)
-        if not hmac.compare_digest(sig, expected):
-            raise ValueError("bad signature")
-        cursor_start = datetime.fromisoformat(start_s.replace("Z", "+00:00")).astimezone(UTC)
-        cursor_end = datetime.fromisoformat(end_s.replace("Z", "+00:00")).astimezone(UTC)
-        if cursor_start != _ensure_aware(range_start) or cursor_end != _ensure_aware(range_end):
-            raise ValueError("range mismatch")
-        completed_at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-        if completed_at.tzinfo is None:
-            raise ValueError("naive cursor timestamp")
-        return completed_at.astimezone(UTC), source_sample_id
+        completed_at = _parse_cursor_range(
+            start_s, end_s, stamp, range_start, range_end
+        )
+        return completed_at, source_sample_id
     except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
         raise AppError(
             code="INVALID_CURSOR",
             message="cursor is malformed or invalid",
             status_code=422,
         ) from exc
+
+
+def encode_page_cursor(
+    *,
+    secret: str,
+    kind: str,
+    range_start: datetime,
+    range_end: datetime,
+    stamp: datetime,
+    source_sample_id: str,
+) -> str:
+    return _encode_signed_cursor(
+        secret,
+        "v1",
+        kind,
+        _iso_z(range_start),
+        _iso_z(range_end),
+        _iso_z(stamp),
+        source_sample_id,
+    )
+
+
+def decode_page_cursor(
+    *,
+    secret: str,
+    cursor: str,
+    kind: str,
+    range_start: datetime,
+    range_end: datetime,
+) -> tuple[datetime, str]:
+    try:
+        if kind not in PAGE_CURSOR_KINDS:
+            raise ValueError("bad cursor kind")
+        version, cursor_kind, start_s, end_s, stamp, source_sample_id = (
+            _decode_signed_cursor(secret, cursor, 6)
+        )
+        if version != "v1" or cursor_kind != kind:
+            raise ValueError("bad cursor fields")
+        stamp_at = _parse_cursor_range(start_s, end_s, stamp, range_start, range_end)
+        return stamp_at, source_sample_id
+    except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
+        raise AppError(
+            code="INVALID_CURSOR",
+            message="cursor is malformed or invalid",
+            status_code=422,
+        ) from exc
+
+
+def _duration_minutes(start: datetime, end: datetime) -> float:
+    return round((_ensure_aware(end) - _ensure_aware(start)).total_seconds() / 60, 1)
+
+
+def _keyset_after(column, cursor_at: datetime, source_sample_id_column, cursor_id: str):
+    return (column > cursor_at) | ((column == cursor_at) & (source_sample_id_column > cursor_id))
+
+
+def _interval_freshness(items: Sequence[Any]) -> datetime | None:
+    if not items:
+        return None
+    return max(item.end_time for item in items)
+
+
+@dataclass(frozen=True)
+class _ListWindow:
+    request_id: str
+    start_utc: datetime
+    end_utc: datetime
+    timezone: str
+    page_size: int
+    user: User
 
 
 def _coverage_category(count: Any, first_at: Any, last_at: Any) -> CoverageCategory:
@@ -180,6 +295,112 @@ class HealthDataQueryService:
             )
         return user
 
+    async def _prepare_list(
+        self,
+        *,
+        request_id: str,
+        start: datetime,
+        end: datetime,
+        timezone: str | None,
+        limit: int | None,
+        max_days: int | None = None,
+        range_label: str | None = None,
+    ) -> _ListWindow:
+        start_utc, end_utc = validate_time_range(start, end)
+        tz_name = parse_timezone(timezone)
+        if max_days is not None:
+            enforce_max_range_days(
+                start_utc,
+                end_utc,
+                max_days=max_days,
+                label=range_label or "Query",
+            )
+        return _ListWindow(
+            request_id=request_id,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            timezone=tz_name,
+            page_size=validate_page_limit(limit),
+            user=await self.resolve_personal_user(),
+        )
+
+    def _cursor_keyset(
+        self,
+        *,
+        cursor: str | None,
+        kind: str,
+        window: _ListWindow,
+        sort_column: Any,
+        id_column: Any,
+    ) -> Any | None:
+        if not cursor:
+            return None
+        secret = self.settings.read_api_key
+        if kind == "meals":
+            cursor_at, cursor_id = decode_meal_cursor(
+                secret=secret,
+                cursor=cursor,
+                range_start=window.start_utc,
+                range_end=window.end_utc,
+            )
+        else:
+            cursor_at, cursor_id = decode_page_cursor(
+                secret=secret,
+                cursor=cursor,
+                kind=kind,
+                range_start=window.start_utc,
+                range_end=window.end_utc,
+            )
+        return _keyset_after(sort_column, cursor_at, id_column, cursor_id)
+
+    def _paged_response[TItem, TResp](
+        self,
+        *,
+        window: _ListWindow,
+        rows: Sequence[Any],
+        kind: str,
+        item_builder: Callable[[Any], TItem],
+        stamp_of_row: Callable[[Any], datetime],
+        id_of_row: Callable[[Any], str],
+        fresh_of_items: Callable[[list[TItem]], datetime | None],
+        response_cls: type[TResp],
+    ) -> TResp:
+        truncated = len(rows) > window.page_size
+        page = list(rows[: window.page_size])
+        items = [item_builder(row) for row in page]
+        next_cursor = None
+        if truncated and page:
+            last = page[-1]
+            secret = self.settings.read_api_key
+            if kind == "meals":
+                next_cursor = encode_meal_cursor(
+                    secret=secret,
+                    range_start=window.start_utc,
+                    range_end=window.end_utc,
+                    completed_at=stamp_of_row(last),
+                    source_sample_id=id_of_row(last),
+                )
+            else:
+                next_cursor = encode_page_cursor(
+                    secret=secret,
+                    kind=kind,
+                    range_start=window.start_utc,
+                    range_end=window.end_utc,
+                    stamp=stamp_of_row(last),
+                    source_sample_id=id_of_row(last),
+                )
+        return response_cls(
+            request_id=window.request_id,
+            start=window.start_utc,
+            end=window.end_utc,
+            timezone=window.timezone,
+            record_count=len(items),
+            truncated=truncated,
+            next_cursor=next_cursor,
+            data_fresh_through=fresh_of_items(items) if items else None,
+            items=items,
+        )
+
     async def coverage(
         self,
         *,
@@ -217,13 +438,14 @@ class HealthDataQueryService:
         workouts_q = select(
             literal("workouts").label("kind"),
             func.count().label("count"),
+            # first_at / last_at remain min/max stored start_time of overlapping rows.
             func.min(Workout.start_time).label("first_at"),
             func.max(Workout.start_time).label("last_at"),
         ).where(
             Workout.user_id == user.id,
             Workout.deleted_at.is_(None),
-            Workout.start_time >= start_utc,
             Workout.start_time < end_utc,
+            Workout.end_time > start_utc,
         )
         sleep_q = select(
             literal("sleep_intervals").label("kind"),
@@ -233,8 +455,8 @@ class HealthDataQueryService:
         ).where(
             SleepInterval.user_id == user.id,
             SleepInterval.deleted_at.is_(None),
-            SleepInterval.start_time >= start_utc,
             SleepInterval.start_time < end_utc,
+            SleepInterval.end_time > start_utc,
         )
         weight_q = select(
             literal("weight_measurements").label("kind"),
@@ -355,33 +577,29 @@ class HealthDataQueryService:
         limit: int | None,
         cursor: str | None,
     ) -> MealsResponse:
-        start_utc, end_utc = validate_time_range(start, end)
-        tz_name = parse_timezone(timezone)
-        page_size = validate_meal_limit(limit)
-        user = await self.resolve_personal_user()
-
+        window = await self._prepare_list(
+            request_id=request_id,
+            start=start,
+            end=end,
+            timezone=timezone,
+            limit=limit,
+        )
         conditions = [
-            MealEvent.user_id == user.id,
+            MealEvent.user_id == window.user.id,
             MealEvent.deleted_at.is_(None),
-            MealEvent.meal_completed_at >= start_utc,
-            MealEvent.meal_completed_at < end_utc,
+            MealEvent.meal_completed_at >= window.start_utc,
+            MealEvent.meal_completed_at < window.end_utc,
         ]
-        if cursor:
-            cursor_at, cursor_id = decode_meal_cursor(
-                secret=self.settings.read_api_key,
-                cursor=cursor,
-                range_start=start_utc,
-                range_end=end_utc,
-            )
-            conditions.append(
-                (MealEvent.meal_completed_at > cursor_at)
-                | (
-                    (MealEvent.meal_completed_at == cursor_at)
-                    & (MealEvent.source_sample_id > cursor_id)
-                )
-            )
+        keyset = self._cursor_keyset(
+            cursor=cursor,
+            kind="meals",
+            window=window,
+            sort_column=MealEvent.meal_completed_at,
+            id_column=MealEvent.source_sample_id,
+        )
+        if keyset is not None:
+            conditions.append(keyset)
 
-        # Never select notes / metadata / internal IDs.
         stmt = (
             select(
                 MealEvent.source_sample_id,
@@ -391,43 +609,237 @@ class HealthDataQueryService:
             )
             .where(*conditions)
             .order_by(MealEvent.meal_completed_at.asc(), MealEvent.source_sample_id.asc())
-            .limit(page_size + 1)
+            .limit(window.page_size + 1)
         )
         rows = list((await self.session.execute(stmt)).all())
-        truncated = len(rows) > page_size
-        page = rows[:page_size]
-
-        items = [
-            MealItem(
+        return self._paged_response(
+            window=window,
+            rows=rows,
+            kind="meals",
+            item_builder=lambda row: MealItem(
                 id=row.source_sample_id,
                 meal_completed_at=_ensure_aware(row.meal_completed_at),
                 foods=[str(item) for item in (row.foods or [])],
                 source=row.source,
-            )
-            for row in page
+            ),
+            stamp_of_row=lambda row: row.meal_completed_at,
+            id_of_row=lambda row: row.source_sample_id,
+            fresh_of_items=lambda items: items[-1].meal_completed_at,
+            response_cls=MealsResponse,
+        )
+
+    async def workouts(
+        self,
+        *,
+        request_id: str,
+        start: datetime,
+        end: datetime,
+        timezone: str | None,
+        limit: int | None,
+        cursor: str | None,
+    ) -> WorkoutsResponse:
+        # Overlap uses end_time. There is no ix_workouts_user_id_end_time in M1.
+        # After deploy, inspect EXPLAIN (ANALYZE, BUFFERS) on this query (and
+        # coverage) before adding that index.
+        window = await self._prepare_list(
+            request_id=request_id,
+            start=start,
+            end=end,
+            timezone=timezone,
+            limit=limit,
+            max_days=MAX_WORKOUT_RANGE_DAYS,
+            range_label="Workout",
+        )
+        conditions = [
+            Workout.user_id == window.user.id,
+            Workout.deleted_at.is_(None),
+            Workout.start_time < window.end_utc,
+            Workout.end_time > window.start_utc,
         ]
-        next_cursor = None
-        if truncated and page:
-            last = page[-1]
-            next_cursor = encode_meal_cursor(
-                secret=self.settings.read_api_key,
-                range_start=start_utc,
-                range_end=end_utc,
-                completed_at=last.meal_completed_at,
-                source_sample_id=last.source_sample_id,
+        keyset = self._cursor_keyset(
+            cursor=cursor,
+            kind="workouts",
+            window=window,
+            sort_column=Workout.start_time,
+            id_column=Workout.source_sample_id,
+        )
+        if keyset is not None:
+            conditions.append(keyset)
+
+        stmt = (
+            select(
+                Workout.source_sample_id,
+                Workout.start_time,
+                Workout.end_time,
+                Workout.sport,
+                Workout.distance_meters,
+                Workout.source,
+            )
+            .where(*conditions)
+            .order_by(Workout.start_time.asc(), Workout.source_sample_id.asc())
+            .limit(window.page_size + 1)
+        )
+        rows = list((await self.session.execute(stmt)).all())
+        return self._paged_response(
+            window=window,
+            rows=rows,
+            kind="workouts",
+            item_builder=lambda row: WorkoutItem(
+                id=row.source_sample_id,
+                start_time=_ensure_aware(row.start_time),
+                end_time=_ensure_aware(row.end_time),
+                sport=row.sport,
+                distance_meters=_dec(row.distance_meters),
+                duration_minutes=_duration_minutes(row.start_time, row.end_time),
+                source=row.source,
+            ),
+            stamp_of_row=lambda row: row.start_time,
+            id_of_row=lambda row: row.source_sample_id,
+            fresh_of_items=_interval_freshness,
+            response_cls=WorkoutsResponse,
+        )
+
+    async def sleep_intervals(
+        self,
+        *,
+        request_id: str,
+        start: datetime,
+        end: datetime,
+        timezone: str | None,
+        limit: int | None,
+        cursor: str | None,
+    ) -> SleepIntervalsResponse:
+        window = await self._prepare_list(
+            request_id=request_id,
+            start=start,
+            end=end,
+            timezone=timezone,
+            limit=limit,
+            max_days=MAX_SLEEP_RANGE_DAYS,
+            range_label="Sleep interval",
+        )
+        conditions = [
+            SleepInterval.user_id == window.user.id,
+            SleepInterval.deleted_at.is_(None),
+            SleepInterval.start_time < window.end_utc,
+            SleepInterval.end_time > window.start_utc,
+        ]
+        keyset = self._cursor_keyset(
+            cursor=cursor,
+            kind="sleep_intervals",
+            window=window,
+            sort_column=SleepInterval.start_time,
+            id_column=SleepInterval.source_sample_id,
+        )
+        if keyset is not None:
+            conditions.append(keyset)
+
+        stmt = (
+            select(
+                SleepInterval.source_sample_id,
+                SleepInterval.start_time,
+                SleepInterval.end_time,
+                SleepInterval.stage,
+                SleepInterval.source,
+            )
+            .where(*conditions)
+            .order_by(SleepInterval.start_time.asc(), SleepInterval.source_sample_id.asc())
+            .limit(window.page_size + 1)
+        )
+        rows = list((await self.session.execute(stmt)).all())
+        return self._paged_response(
+            window=window,
+            rows=rows,
+            kind="sleep_intervals",
+            item_builder=lambda row: SleepIntervalItem(
+                id=row.source_sample_id,
+                start_time=_ensure_aware(row.start_time),
+                end_time=_ensure_aware(row.end_time),
+                duration_minutes=_duration_minutes(row.start_time, row.end_time),
+                stage=row.stage,
+                source=row.source,
+            ),
+            stamp_of_row=lambda row: row.start_time,
+            id_of_row=lambda row: row.source_sample_id,
+            fresh_of_items=_interval_freshness,
+            response_cls=SleepIntervalsResponse,
+        )
+
+    async def weight_measurements(
+        self,
+        *,
+        request_id: str,
+        start: datetime,
+        end: datetime,
+        timezone: str | None,
+        limit: int | None,
+        cursor: str | None,
+    ) -> WeightMeasurementsResponse:
+        window = await self._prepare_list(
+            request_id=request_id,
+            start=start,
+            end=end,
+            timezone=timezone,
+            limit=limit,
+            max_days=MAX_WEIGHT_RANGE_DAYS,
+            range_label="Weight measurement",
+        )
+        conditions = [
+            WeightMeasurement.user_id == window.user.id,
+            WeightMeasurement.deleted_at.is_(None),
+            WeightMeasurement.measured_at >= window.start_utc,
+            WeightMeasurement.measured_at < window.end_utc,
+        ]
+        keyset = self._cursor_keyset(
+            cursor=cursor,
+            kind="weight_measurements",
+            window=window,
+            sort_column=WeightMeasurement.measured_at,
+            id_column=WeightMeasurement.source_sample_id,
+        )
+        if keyset is not None:
+            conditions.append(keyset)
+
+        stmt = (
+            select(
+                WeightMeasurement.source_sample_id,
+                WeightMeasurement.measured_at,
+                WeightMeasurement.value_kg,
+                WeightMeasurement.source,
+            )
+            .where(*conditions)
+            .order_by(
+                WeightMeasurement.measured_at.asc(),
+                WeightMeasurement.source_sample_id.asc(),
+            )
+            .limit(window.page_size + 1)
+        )
+        rows = list((await self.session.execute(stmt)).all())
+
+        def _weight_item(row: Any) -> WeightMeasurementItem:
+            value_kg = _dec(row.value_kg)
+            if value_kg is None:
+                raise AppError(
+                    code="QUERY_FAILED",
+                    message="The requested health data could not be retrieved",
+                    status_code=500,
+                )
+            return WeightMeasurementItem(
+                id=row.source_sample_id,
+                measured_at=_ensure_aware(row.measured_at),
+                value_kg=value_kg,
+                source=row.source,
             )
 
-        fresh = items[-1].meal_completed_at if items else None
-        return MealsResponse(
-            request_id=request_id,
-            start=start_utc,
-            end=end_utc,
-            timezone=tz_name,
-            record_count=len(items),
-            truncated=truncated,
-            next_cursor=next_cursor,
-            data_fresh_through=fresh,
-            items=items,
+        return self._paged_response(
+            window=window,
+            rows=rows,
+            kind="weight_measurements",
+            item_builder=_weight_item,
+            stamp_of_row=lambda row: row.measured_at,
+            id_of_row=lambda row: row.source_sample_id,
+            fresh_of_items=lambda items: items[-1].measured_at,
+            response_cls=WeightMeasurementsResponse,
         )
 
     async def _glucose_raw(

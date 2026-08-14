@@ -7,17 +7,17 @@ Personal FastAPI + PostgreSQL service that ingests an iOS HealthKit export, stor
 - Accept version-1 iOS export payloads via `POST /v1/ingest/batch`
 - Store one raw payload copy per ingestion batch (audit/debug)
 - Upsert typed rows keyed by `(user_id, source, source_sample_id)`
-- Expose Query API v1: `coverage`, `glucose/series`, `glucose/summary`, `meals`
+- Expose Query API v1: `coverage`, `glucose/series`, `glucose/summary`, `meals`, `workouts`, `sleep-intervals`, `weight-measurements`
 - Separate ingest (`INGEST_API_KEY`) and read (`READ_API_KEY`) credentials
 - Request ID on every response (persistent request-audit storage is deferred)
 
 ## What Phase 1 does **not** do
 
 - Direct HealthKit access, iOS upload, OAuth, or multi-user product flows
-- Agent orchestration, charts/UI, workout/sleep/weight Query API routes (coverage reports existence only)
+- Agent orchestration, charts/UI
 - Arbitrary SQL or natural-language → SQL
 - Sleep sessionization, fasting windows, meal-response derivation
-- Meal notes in Query API responses
+- Meal notes, workout heart rate/energy, or `source_name` in Query API responses
 
 ## Architecture
 
@@ -130,10 +130,17 @@ All query endpoints are **read-only** and require explicit bounded time ranges (
 | GET | `/v1/query/glucose/series` | Raw or aggregated glucose (`raw`/`5m`/`15m`/`hourly`) |
 | GET | `/v1/query/glucose/summary` | Overall or daily descriptive stats |
 | GET | `/v1/query/meals` | Meals with foods (notes excluded); cursor pagination |
+| GET | `/v1/query/workouts` | Workout intervals overlapping the window; cursor pagination |
+| GET | `/v1/query/sleep-intervals` | Raw sleep intervals overlapping the window; cursor pagination |
+| GET | `/v1/query/weight-measurements` | Weight measurements in `[start, end)`; cursor pagination |
 
-Glucose resolution hard limits: raw 7d, 5m 31d, 15m 90d, hourly 365d (oversized ranges rejected). Hard ceiling of **10000** returned glucose points (raw or buckets) → `RESULT_TOO_LARGE`. Meals default `limit=100`, max `500` with HMAC-signed cursors bound to the request range.
+Glucose resolution hard limits: raw 7d, 5m 31d, 15m 90d, hourly 365d (oversized ranges rejected). Hard ceiling of **10000** returned glucose points (raw or buckets) → `RESULT_TOO_LARGE`. List endpoints default `limit=100`, max `500` with HMAC-signed cursors bound to the resource and request range. Workout/weight windows max **365** days; sleep-interval windows max **90** days.
 
-**Resource protection:** there is **no in-process rate limiter**. Protection is range limits, meal page size, glucose point ceiling, and `QUERY_STATEMENT_TIMEOUT_MS` (default 10s) on Query API Postgres statements, plus whatever the host platform provides.
+Workouts and sleep intervals use **interval overlap** for both coverage and list endpoints: `start_time < end AND end_time > start`. Coverage `first_at` / `last_at` are min/max stored `start_time` among included records (not `end_time`). Glucose, meals, and weight still count timestamps in `[start, end)` (`sample_time`, `meal_completed_at`, `measured_at`).
+
+Overlap list/coverage queries filter `end_time` without `ix_workouts_user_id_end_time`. After deploy, inspect `EXPLAIN (ANALYZE, BUFFERS)` on those queries and add an index only if the plan or measured latency justifies it.
+
+**Resource protection:** there is **no in-process rate limiter**. Protection is range limits, list page size, glucose point ceiling, and `QUERY_STATEMENT_TIMEOUT_MS` (default 10s) on Query API Postgres statements, plus whatever the host platform provides.
 
 **Breaking change (0.2.0):** POST `/v1/query/series/*` and `/v1/query/events/meals` were removed. Use GET `/v1/query/*` only.
 
@@ -156,7 +163,7 @@ Query API time-range queries use half-open windows:
 [start, end)
 ```
 
-Include records at exactly `start`; exclude records at exactly `end`. Glucose series additionally enforces per-resolution maximum spans (see above). Meal pages never silently truncate: when more rows remain, `truncated=true` and `next_cursor` are returned.
+Include records at exactly `start`; exclude records at exactly `end`. Workouts and sleep intervals are included when they **overlap** `[start, end)` (`start_time < end AND end_time > start`); a record that only touches a bound is excluded (`end_time == start` or `start_time == end`). Glucose series additionally enforces per-resolution maximum spans (see above). Meal pages never silently truncate: when more rows remain, `truncated=true` and `next_cursor` are returned.
 
 ## Example curl commands
 
@@ -229,11 +236,35 @@ curl -sS \
   -H "Authorization: Bearer $READ_API_KEY" | python -m json.tool
 ```
 
+### Workouts
+
+```bash
+curl -sS \
+  "http://127.0.0.1:8000/v1/query/workouts?start=2026-08-01T00:00:00Z&end=2026-08-12T00:00:00Z" \
+  -H "Authorization: Bearer $READ_API_KEY" | python -m json.tool
+```
+
+### Sleep intervals
+
+```bash
+curl -sS \
+  "http://127.0.0.1:8000/v1/query/sleep-intervals?start=2026-08-01T00:00:00Z&end=2026-08-12T00:00:00Z" \
+  -H "Authorization: Bearer $READ_API_KEY" | python -m json.tool
+```
+
+### Weight measurements
+
+```bash
+curl -sS \
+  "http://127.0.0.1:8000/v1/query/weight-measurements?start=2026-08-01T00:00:00Z&end=2026-08-12T00:00:00Z" \
+  -H "Authorization: Bearer $READ_API_KEY" | python -m json.tool
+```
+
 ## Data privacy / logging policy
 
 **Logged (application logs, metadata only):** request ID, path, method, status, error type. Persistent per-request audit rows (`request_audit_logs`) are deferred to a later phase; the Phase 1 schema intentionally omits that table.
 
-**Not logged:** Authorization headers, raw export payloads (except the intentional one-copy `ingestion_batches.raw_payload`), glucose arrays, meal foods/text, full response bodies, database credentials.
+**Not logged:** Authorization headers, raw export payloads (except the intentional one-copy `ingestion_batches.raw_payload`), glucose arrays, meal foods/text, sleep stages, weight values, workout heart rate/energy, source sample IDs, full response bodies, database credentials.
 
 ## MCP service
 

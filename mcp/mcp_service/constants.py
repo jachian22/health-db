@@ -6,8 +6,14 @@ The Query API remains the source of truth and re-validates every request.
 from __future__ import annotations
 
 DEFAULT_QUERY_TIMEZONE = "America/New_York"
-DEFAULT_MEAL_LIMIT = 100
-MAX_MEAL_LIMIT = 500
+DEFAULT_PAGE_LIMIT = 100
+MAX_PAGE_LIMIT = 500
+DEFAULT_MEAL_LIMIT = DEFAULT_PAGE_LIMIT
+MAX_MEAL_LIMIT = MAX_PAGE_LIMIT
+
+MAX_WORKOUT_RANGE_DAYS = 365
+MAX_SLEEP_RANGE_DAYS = 90
+MAX_WEIGHT_RANGE_DAYS = 365
 
 ALLOWED_GLUCOSE_RESOLUTIONS = ("raw", "5m", "15m", "hourly")
 ALLOWED_SUMMARY_BUCKETS = ("overall", "daily")

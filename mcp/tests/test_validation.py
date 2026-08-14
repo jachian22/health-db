@@ -193,3 +193,118 @@ async def test_cursor_passed_through_opaque(mcp_server, fake_query_client: FakeQ
         )
     assert result.is_error is False
     assert fake_query_client.calls[0][1]["cursor"] == cursor
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    ["get_workouts", "get_sleep_intervals", "get_weight_measurements"],
+)
+async def test_new_tools_naive_start_rejected(
+    mcp_server, fake_query_client: FakeQueryClient, tool_name: str
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            tool_name,
+            {
+                "start": "2026-08-01T00:00:00",
+                "end": "2026-08-12T00:00:00Z",
+            },
+        )
+    assert result.is_error is True
+    body = _payload(result)
+    assert body.get("code") == "INVALID_TIME_RANGE"
+    assert fake_query_client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    ["get_workouts", "get_sleep_intervals", "get_weight_measurements"],
+)
+async def test_new_tools_end_not_after_start_rejected(
+    mcp_server, fake_query_client: FakeQueryClient, tool_name: str
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            tool_name,
+            {
+                "start": "2026-08-12T00:00:00Z",
+                "end": "2026-08-01T00:00:00Z",
+            },
+        )
+    assert result.is_error is True
+    body = _payload(result)
+    assert body["code"] == "INVALID_TIME_RANGE"
+    assert fake_query_client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "end", "max_days"),
+    [
+        ("get_workouts", "2027-08-02T00:00:00Z", 365),
+        ("get_weight_measurements", "2027-08-02T00:00:00Z", 365),
+        ("get_sleep_intervals", "2026-10-31T00:00:00Z", 90),
+    ],
+)
+async def test_new_tools_range_too_large_rejected_before_upstream(
+    mcp_server,
+    fake_query_client: FakeQueryClient,
+    tool_name: str,
+    end: str,
+    max_days: int,
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            tool_name,
+            {"start": "2026-08-01T00:00:00Z", "end": end},
+        )
+    assert result.is_error is True
+    body = _payload(result)
+    assert body["code"] == "RANGE_TOO_LARGE"
+    assert body["max_days"] == max_days
+    assert fake_query_client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    ["get_workouts", "get_sleep_intervals", "get_weight_measurements"],
+)
+async def test_new_tools_limit_above_500_rejected(
+    mcp_server, fake_query_client: FakeQueryClient, tool_name: str
+):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            tool_name,
+            {
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-12T00:00:00Z",
+                "limit": 501,
+            },
+        )
+    assert result.is_error is True
+    assert fake_query_client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    ["get_workouts", "get_sleep_intervals", "get_weight_measurements"],
+)
+async def test_new_tools_cursor_passed_through_opaque(
+    mcp_server, fake_query_client: FakeQueryClient, tool_name: str
+):
+    cursor = "  weird/cursor+value==  "
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            tool_name,
+            {
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-12T00:00:00Z",
+                "cursor": cursor,
+            },
+        )
+    assert result.is_error is False
+    assert fake_query_client.calls[0][1]["cursor"] == cursor

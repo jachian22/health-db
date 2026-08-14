@@ -16,6 +16,9 @@ from mcp_service.query_api_client import (
     GLUCOSE_SUMMARY_PATH,
     MEALS_PATH,
     READY_PATH,
+    SLEEP_INTERVALS_PATH,
+    WEIGHT_MEASUREMENTS_PATH,
+    WORKOUTS_PATH,
     HealthDBQueryAPIClient,
 )
 from mcp_service.tools import build_mcp_server
@@ -112,6 +115,26 @@ async def test_series_summary_meals_routes():
                     "items": [],
                 },
             )
+        if request.url.path in {
+            WORKOUTS_PATH,
+            SLEEP_INTERVALS_PATH,
+            WEIGHT_MEASUREMENTS_PATH,
+        }:
+            assert request.url.params["limit"] == "10"
+            assert request.url.params["cursor"] == "page-2"
+            assert request.headers["authorization"] == f"Bearer {TEST_READ_KEY}"
+            return httpx.Response(
+                200,
+                json={
+                    "request_id": "x",
+                    "start": START.isoformat(),
+                    "end": END.isoformat(),
+                    "timezone": "America/New_York",
+                    "record_count": 0,
+                    "truncated": False,
+                    "items": [],
+                },
+            )
         return httpx.Response(404, json={"error": {"code": "NO", "message": "no"}})
 
     client = _client_for(handler)
@@ -124,8 +147,24 @@ async def test_series_summary_meals_routes():
     await client.get_meals(
         start=START, end=END, timezone="America/New_York", limit=25, cursor="abc"
     )
+    await client.get_workouts(
+        start=START, end=END, timezone="America/New_York", limit=10, cursor="page-2"
+    )
+    await client.get_sleep_intervals(
+        start=START, end=END, timezone="America/New_York", limit=10, cursor="page-2"
+    )
+    await client.get_weight_measurements(
+        start=START, end=END, timezone="America/New_York", limit=10, cursor="page-2"
+    )
     await client.aclose()
-    assert paths == [GLUCOSE_SERIES_PATH, GLUCOSE_SUMMARY_PATH, MEALS_PATH]
+    assert paths == [
+        GLUCOSE_SERIES_PATH,
+        GLUCOSE_SUMMARY_PATH,
+        MEALS_PATH,
+        WORKOUTS_PATH,
+        SLEEP_INTERVALS_PATH,
+        WEIGHT_MEASUREMENTS_PATH,
+    ]
 
 
 @pytest.mark.asyncio
