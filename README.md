@@ -32,6 +32,8 @@ iPhone app
 
 The MCP service is a separate Railway service in this repository (`mcp/`). It does not connect to Postgres. See [docs/mcp.md](docs/mcp.md).
 
+An ML extraction layer (`ml/`) reads the Query API and writes versioned Parquet snapshots, then separate commands can diagnose a snapshot and generate a deterministic forecast-episode dataset without calling the API. It does not change Postgres or the Query API. See [ml/README.md](ml/README.md).
+
 ## Environment variables
 
 | Variable | Required | Description |

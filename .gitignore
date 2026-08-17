@@ -22,3 +22,6 @@ htmlcov/
 .idea/
 .vscode/
 .cursor/mcp.json
+data/snapshots/
+data/diagnostics/
+data/episodes/
